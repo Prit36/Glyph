@@ -27,6 +27,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -68,17 +69,112 @@ struct Word {
 struct Span { int begin{}, end{}; };
 struct WordRow { size_t first{}, end{}; RECT bounds{}; };
 struct TextMetrics { std::vector<int> advances; int width{}; };
+class FontCache;
+int length(const Word& w);
+// Heterogeneous lookup avoids copying every word just to probe the cache.
+struct MetricsKeyLess {
+    using is_transparent = void;
+    bool operator()(const auto& a, const auto& b) const {
+        if (a.first != b.first) return a.first < b.first;
+        return std::wstring_view(a.second) < std::wstring_view(b.second);
+    }
+};
+class TextMetricsCache {
+    std::map<std::pair<int, std::wstring>, TextMetrics, MetricsKeyLess> entries;
+    TextMetrics scratch;
+    size_t payload{};
+public:
+    // Budget used key/advance bytes; allocator slack and map-node overhead are
+    // additional, bounded by the entry limit. Discard this cache after result
+    // preparation: character edges already retain what the UI needs.
+    static constexpr size_t maxPayload = 64 * 1024, maxEntries = 256;
+    const TextMetrics& get(int height, const std::wstring& text, HDC dc, FontCache& fonts);
+};
 class FontCache {
     std::vector<std::pair<int, HFONT>> fonts;
 public:
+    static constexpr size_t maxFonts = 64;
     ~FontCache() { clear(); }
     HFONT get(int height) {
         for (auto [size, font] : fonts) if (size == height) return font;
         HFONT font = CreateFont(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         if (!font) throw std::runtime_error("Cannot create selection font metrics");
-        fonts.emplace_back(height, font); return font;
+        // Callers restore their previous font before requesting another one.
+        // Keep exact sizes while bounding handles for boxes with many heights.
+        if (fonts.size() == maxFonts) { DeleteObject(fonts.front().second); fonts.erase(fonts.begin()); }
+        try { fonts.emplace_back(height, font); }
+        catch (...) { DeleteObject(font); throw; }
+        return font;
     }
     void clear() { for (auto [size, font] : fonts) DeleteObject(font); fonts.clear(); }
+};
+const TextMetrics& TextMetricsCache::get(int height, const std::wstring& text, HDC dc, FontCache& fonts) {
+    auto found = entries.find(std::pair{height, std::wstring_view(text)});
+    if (found != entries.end()) return found->second;
+    scratch.advances.resize(text.size());
+    auto old = SelectObject(dc, fonts.get(height)); SIZE extent{};
+    BOOL ok = GetTextExtentExPoint(dc, text.c_str(), static_cast<int>(text.size()), 0, nullptr, scratch.advances.data(), &extent);
+    SelectObject(dc, old); scratch.width = ok ? extent.cx : 0;
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t) + text.size() * sizeof(int);
+    if (entries.size() < maxEntries && bytes <= maxPayload - payload) {
+        auto [entry, inserted] = entries.emplace(std::pair{height, text}, scratch);
+        if (inserted) payload += bytes;
+        return entry->second;
+    }
+    return scratch;
+}
+
+class HighlightRows {
+    struct Row { size_t first{}, end{}; RECT bounds{}; LONG maxBottom{}; };
+    std::vector<Row> rows;
+    bool dirty = true;
+public:
+    void changed() { dirty = true; }
+    void clear() { std::vector<Row>().swap(rows); dirty = true; }
+    void prepare(const std::vector<Word>& words, const std::vector<WordRow>& wordRows) {
+        if (!dirty) return;
+        rows.clear();
+        for (const auto& row : wordRows) {
+            RECT bounds = words[row.first].highlightBand;
+            for (size_t i = row.first + 1; i < row.end; ++i) UnionRect(&bounds, &bounds, &words[i].highlightBand);
+            --bounds.left; ++bounds.right;
+            rows.push_back({row.first, row.end, bounds, 0});
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.bounds.top < b.bounds.top; });
+        LONG bottom = LONG_MIN;
+        for (auto& row : rows) { bottom = std::max(bottom, row.bounds.bottom); row.maxBottom = bottom; }
+        dirty = false;
+    }
+    template<typename Draw>
+    void intersecting(RECT damage, const std::vector<Word>& words, const std::vector<Span>& selection, Draw draw) const {
+        // Prefix maxima also handle overlapping added boxes and tall lines.
+        auto first = std::upper_bound(rows.begin(), rows.end(), damage.top,
+            [](LONG top, const auto& row) { return top < row.maxBottom; });
+        for (; first != rows.end() && first->bounds.top < damage.bottom; ++first) {
+            RECT clipped{};
+            if (IntersectRect(&clipped, &first->bounds, &damage)) drawRow(*first, damage, words, selection, draw);
+        }
+    }
+private:
+    template<typename Draw>
+    static void drawRow(const Row& row, RECT damage, const std::vector<Word>& words, const std::vector<Span>& selection, Draw draw) {
+        RECT strip{}; bool haveStrip = false; size_t previousIndex = 0;
+        auto append = [&] { RECT clipped{}; if (IntersectRect(&clipped, &strip, &damage)) draw(clipped); };
+        for (size_t i = row.first; i < row.end; ++i) {
+            const auto& w = words[i]; auto s = selection[i];
+            if (s.begin >= s.end) { if (haveStrip) append(); haveStrip = false; continue; }
+            RECT next{w.edges[s.begin], w.highlightBand.top, w.edges[s.end], w.highlightBand.bottom};
+            if (s.begin == 0) --next.left;
+            if (s.end == length(w)) ++next.right;
+            bool connect = haveStrip && previousIndex + 1 == i && selection[previousIndex].end == length(words[previousIndex]) && s.begin == 0 &&
+                words[previousIndex].line == w.line && words[previousIndex].monitor == w.monitor && strip.top == next.top && strip.bottom == next.bottom &&
+                next.left - strip.right <= std::max(12L, (next.bottom - next.top) * 2);
+            if (connect) strip.right = std::max(strip.right, next.right);
+            else { if (haveStrip) append(); strip = next; haveStrip = true; }
+            previousIndex = i;
+        }
+        if (haveStrip) append();
+    }
 };
 struct Settings { std::wstring hotkey = L"Ctrl+Alt+T", language = L"auto"; UINT modifiers = MOD_CONTROL | MOD_ALT, key = 'T'; };
 struct Job { uint64_t id{}; std::shared_ptr<Frame> frame; RECT region{}; std::wstring language; Clock::time_point started; };
@@ -595,11 +691,12 @@ public:
     std::vector<WordRow> wordRows;
     std::vector<Span> selection, baseSelection, nextSelection;
     FontCache fonts;
-    std::map<std::pair<int, std::wstring>, TextMetrics> textMetrics;
+    HighlightRows highlights;
     std::vector<std::pair<std::wstring, std::wstring>> languages;
     std::unique_ptr<Bitmap> canvas;
     HDC renderDc{};
     HGDIOBJ previousCanvas{};
+    HPEN outlinePen{};
     HICON icon{};
     bool active{}, recognizing{}, dragging{}, boxMode{}, addRegion{}, quitting{};
     bool hotkeyRegistered{};
@@ -616,6 +713,7 @@ public:
     void releaseCanvas() {
         if (renderDc) { SelectObject(renderDc, previousCanvas); DeleteDC(renderDc); renderDc = nullptr; }
         canvas.reset();
+        if (outlinePen) { DeleteObject(outlinePen); outlinePen = nullptr; }
     }
     void allocateCanvas() {
         releaseCanvas();
@@ -625,6 +723,8 @@ public:
         renderDc = CreateCompatibleDC(nullptr);
         if (!renderDc) throw std::runtime_error("Cannot create overlay render device");
         previousCanvas = SelectObject(renderDc,canvas->handle);
+        outlinePen = CreatePen(PS_DOT, 1, RGB(84, 209, 255));
+        if (!outlinePen) throw std::runtime_error("Cannot create selection outline pen");
     }
     int ui(int value) const { return static_cast<int>(std::lround(value * uiScale)); }
     void invalidate() {
@@ -722,6 +822,7 @@ public:
         }
         catch (const std::exception& e) { frame.reset(); releaseCanvas(); notify(widen(e), true); return; }
         words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear(); detectedLanguage.clear();
+        highlights.clear();
         status = L"Drag a box over text. Release to recognize and select it.";
         active = true; recognizing = false; dragging = false; boxMode = true; anchorWord = -1; elapsed = 0;
         selectionBox = {};
@@ -746,20 +847,13 @@ public:
         SetWindowLongPtr(window, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
         std::vector<Word>().swap(words); std::vector<WordRow>().swap(wordRows);
         std::vector<Span>().swap(selection); std::vector<Span>().swap(baseSelection); std::vector<Span>().swap(nextSelection);
-        fonts.clear(); textMetrics.clear(); frame.reset(); releaseCanvas();
+        fonts.clear(); highlights.clear(); frame.reset(); releaseCanvas();
         if (restoreFocus && IsWindow(previousWindow)) SetForegroundWindow(previousWindow);
     }
-    void measure(Word& word, HDC dc) {
+    void measure(Word& word, HDC dc, TextMetricsCache& cache) {
         int count = length(word); word.edges.resize(count + 1); word.edges[0] = word.rect.left;
         int height = std::max(8L, word.rect.bottom - word.rect.top);
-        auto [entry, inserted] = textMetrics.try_emplace({height, word.text});
-        auto& metrics = entry->second;
-        if (inserted) {
-            auto old = SelectObject(dc, fonts.get(height)); SIZE extent{};
-            metrics.advances.resize(count);
-            BOOL ok = GetTextExtentExPoint(dc, word.text.c_str(), count, 0, nullptr, metrics.advances.data(), &extent);
-            SelectObject(dc, old); metrics.width = ok ? extent.cx : 0;
-        }
+        const auto& metrics = cache.get(height, word.text, dc, fonts);
         int width = word.rect.right - word.rect.left;
         for (int i = 1; i <= count; ++i) word.edges[i] = word.rect.left + (metrics.width > 0 ? MulDiv(metrics.advances[i - 1], width, metrics.width) : MulDiv(i, width, count));
         word.edges.back() = word.rect.right;
@@ -784,11 +878,12 @@ public:
         }
         int lineOffset = words.empty() ? 0 : words.back().line + 1;
         for (auto& word : r.words) word.line += lineOffset;
-        HDC dc = GetDC(window);
+        // Use the existing render DC; it is session-owned and remains valid if
+        // font/metrics allocation throws, unlike an acquired window DC.
+        HDC dc = renderDc; TextMetricsCache metrics;
         size_t existing = words.size();
         words.insert(words.end(), std::make_move_iterator(r.words.begin()), std::make_move_iterator(r.words.end()));
-        for (size_t i = existing; i < words.size(); ++i) measure(words[i], dc);
-        ReleaseDC(window, dc);
+        for (size_t i = existing; i < words.size(); ++i) measure(words[i], dc, metrics);
         // OCR boxes describe ink rather than line height: short letters, capitals, and
         // descenders have different bounds. Normalize nearby words into one padded
         // band, splitting wide gaps so unrelated columns never get connected.
@@ -817,6 +912,7 @@ public:
         selection.resize(words.size()); baseSelection.resize(words.size());
         for (size_t i = existing; i < words.size(); ++i) selection[i] = {0, length(words[i])};
         baseSelection = selection;
+        highlights.changed();
         elapsed = r.elapsed; detectedLanguage = r.language; recognizing = !r.complete;
         if (!r.error.empty()) status = L"OCR failed: " + r.error;
         else if (r.complete && !foundText) status = L"No text found in this box. Draw another box or try another OCR language.";
@@ -848,6 +944,7 @@ public:
         return {best, c};
     }
     void cancelRecognition() {
+        if (recognizing) { invalidateOutline(selectionBox); invalidate(hud); }
         worker->cancel(); session = worker->generation; recognizing = false;
     }
     void beginRegion(POINT p, bool add) {
@@ -856,7 +953,7 @@ public:
         boxMode = true; addRegion = add; dragOrigin = p; dragging = true;
         selectionBox = dragRegion(p, p, frame->image->width, frame->image->height);
         status = L"Release to recognize and select the text in this box.";
-        SetCapture(window); invalidate();
+        SetCapture(window); invalidate(hud);
     }
     void beginTextSelection(POINT p, bool add) {
         cancelRecognition();
@@ -902,18 +999,24 @@ public:
             if (nextSelection[i].begin < nextSelection[i].end) range = {std::min(nextSelection[i].begin, range.begin), std::max(nextSelection[i].end, range.end)};
             nextSelection[i] = range;
         }
-        RECT dirty{}; bool changed = false;
-        auto include = [&](RECT r) { if (changed) UnionRect(&dirty, &dirty, &r); else { dirty = r; changed = true; } };
+        bool changed = false;
+        // Coalesce consecutive changes on one highlight band, retaining separate
+        // rows in the Windows update region instead of one desktop-sized union.
+        RECT dirty{};
+        auto flush = [&] { if (!IsRectEmpty(&dirty)) invalidate(dirty); dirty = {}; };
         for (size_t i = 0; i < words.size(); ++i) {
             if (selection[i].begin == nextSelection[i].begin && selection[i].end == nextSelection[i].end) continue;
             RECT area = words[i].highlightBand;
             // Include the neighboring space so connected highlights are restored
             // correctly when shrinking or reversing a selection.
             LONG gap = std::max(12L, (area.bottom - area.top) * 2);
-            InflateRect(&area, gap + 2, 2); include(area);
+            InflateRect(&area, gap + 2, 2);
+            if (!IsRectEmpty(&dirty) && (dirty.top != area.top || dirty.bottom != area.bottom)) flush();
+            if (IsRectEmpty(&dirty)) dirty = area; else UnionRect(&dirty, &dirty, &area);
+            changed = true;
         }
         selection.swap(nextSelection);
-        if (changed) invalidate(dirty);
+        if (changed) flush();
     }
     void finishDrag(bool recognize = false) {
         if (!dragging) return;
@@ -925,7 +1028,7 @@ public:
         }
         if (!addRegion) {
             words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear();
-            fonts.clear(); textMetrics.clear(); detectedLanguage.clear();
+            fonts.clear(); highlights.clear(); detectedLanguage.clear();
         }
         recognizing = true; elapsed = 0; status = L"Recognizing selected box...";
         session = ++worker->generation;
@@ -942,24 +1045,24 @@ public:
                 else if (w.line != lastLine) output += L"\r\n";
                 else output += L" ";
             }
-            output += w.text.substr(s.begin, s.end - s.begin); lastLine = w.line; lastMonitor = w.monitor;
+            output.append(w.text, s.begin, s.end - s.begin); lastLine = w.line; lastMonitor = w.monitor;
         }
         return output;
     }
     void copy(bool exitAfter) {
-        if (recognizing) { status = L"Recognizing selected box... Text will be selected automatically when ready."; invalidate(); return; }
+        if (recognizing) { status = L"Recognizing selected box... Text will be selected automatically when ready."; invalidate(hud); return; }
         auto text = selectedText();
-        if (text.empty()) { status = L"Drag a box over text and release to recognize and select it."; invalidate(); return; }
+        if (text.empty()) { status = L"Drag a box over text and release to recognize and select it."; invalidate(hud); return; }
         size_t bytes = (text.size() + 1) * sizeof(wchar_t); HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (!memory) { status = L"Could not allocate clipboard memory."; invalidate(); return; }
+        if (!memory) { status = L"Could not allocate clipboard memory."; invalidate(hud); return; }
         auto pointer = GlobalLock(memory);
-        if (!pointer) { GlobalFree(memory); status = L"Could not access clipboard memory."; invalidate(); return; }
+        if (!pointer) { GlobalFree(memory); status = L"Could not access clipboard memory."; invalidate(hud); return; }
         memcpy(pointer, text.c_str(), bytes); GlobalUnlock(memory);
-        if (!OpenClipboard(window)) { GlobalFree(memory); status = L"Clipboard is busy. Press Ctrl+C again."; invalidate(); return; }
+        if (!OpenClipboard(window)) { GlobalFree(memory); status = L"Clipboard is busy. Press Ctrl+C again."; invalidate(hud); return; }
         bool ok = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, memory); CloseClipboard();
-        if (!ok) { GlobalFree(memory); status = L"Windows could not write the clipboard."; invalidate(); return; }
+        if (!ok) { GlobalFree(memory); status = L"Windows could not write the clipboard."; invalidate(hud); return; }
         status = L"Copied " + std::to_wstring(text.size()) + L" characters. Draw another box, or press Esc to return.";
-        if (exitAfter) exitMode(); else invalidate();
+        if (exitAfter) exitMode(); else invalidate(hud);
     }
     static void fill(HDC dc, RECT r, COLORREF color) {
         SetDCBrushColor(dc,color); FillRect(dc,&r,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
@@ -971,7 +1074,8 @@ public:
     void paint() {
         // Preserve complex update regions: using only rcPaint would repaint the
         // whole box interior even when just its thin outline changed.
-        alignas(RGNDATA) std::array<BYTE,sizeof(RGNDATAHEADER) + 64 * sizeof(RECT)> storage{};
+        constexpr DWORD maxRectangles = 256;
+        alignas(RGNDATA) std::array<BYTE,sizeof(RGNDATAHEADER) + maxRectangles * sizeof(RECT)> storage{};
         auto data = reinterpret_cast<RGNDATA*>(storage.data());
         HRGN update = CreateRectRgn(0,0,0,0); DWORD bytes = 0;
         if (update && GetUpdateRgn(window,update,FALSE) == COMPLEXREGION)
@@ -979,7 +1083,7 @@ public:
         if (update) DeleteObject(update);
         PAINTSTRUCT ps{}; HDC screen = BeginPaint(window, &ps);
         if (!active || !frame || !canvas) { EndPaint(window, &ps); return; }
-        if (bytes && bytes <= storage.size() && data->rdh.nCount <= 64) {
+        if (bytes && bytes <= storage.size() && data->rdh.nCount <= maxRectangles) {
             auto rectangles = reinterpret_cast<const RECT*>(data->Buffer);
             for (DWORD i = 0; i < data->rdh.nCount; ++i) render(screen,rectangles[i]);
         } else render(screen,ps.rcPaint);
@@ -988,6 +1092,7 @@ public:
     void render(HDC screen, RECT damage) {
         RECT bounds{0,0,frame->image->width,frame->image->height};
         if (!IntersectRect(&damage, &damage, &bounds)) return;
+        highlights.prepare(words, wordRows);
         for (LONG y = damage.top; y < damage.bottom; y += canvas->height)
             for (LONG x = damage.left; x < damage.right; x += canvas->width)
                 renderTile(screen,{x,y,std::min(x + canvas->width,damage.right),std::min(y + canvas->height,damage.bottom)});
@@ -999,32 +1104,16 @@ public:
         GdiFlush(); blendRect(*canvas, *frame->image, damage, 0x00080e16, 33,origin);
         SelectClipRgn(dc,nullptr); SetViewportOrgEx(dc,-damage.left,-damage.top,nullptr);
         IntersectClipRect(dc, damage.left, damage.top, damage.right, damage.bottom);
-        // Tint the captured pixels instead of redrawing OCR text in a guessed font.
-        // Merge selected neighboring words into continuous strips, including spaces.
-        auto drawHighlight = [&](RECT strip) {
-            RECT clipped{}; if (!IntersectRect(&clipped, &strip, &damage)) return;
+        // The row index survives character-selection changes. Only words on
+        // rows intersecting this tile need their connected strips evaluated.
+        highlights.intersecting(damage, words, selection, [&](RECT clipped) {
             blendRect(*canvas, *frame->image, clipped, 0x00258cde, 76,origin);
-        };
-        RECT strip{}; bool haveStrip = false; size_t previousIndex = 0;
-        for (size_t i = 0; i < words.size(); ++i) {
-            const auto& w = words[i]; auto s = selection[i];
-            if (s.begin >= s.end) { if (haveStrip) drawHighlight(strip); haveStrip = false; continue; }
-            RECT next{w.edges[s.begin], w.highlightBand.top, w.edges[s.end], w.highlightBand.bottom};
-            if (s.begin == 0) --next.left;
-            if (s.end == length(w)) ++next.right;
-            bool connect = haveStrip && previousIndex + 1 == i && selection[previousIndex].end == length(words[previousIndex]) && s.begin == 0 &&
-                words[previousIndex].line == w.line && words[previousIndex].monitor == w.monitor && strip.top == next.top && strip.bottom == next.bottom &&
-                next.left - strip.right <= std::max(12L, (next.bottom - next.top) * 2);
-            if (connect) strip.right = std::max(strip.right, next.right);
-            else { if (haveStrip) drawHighlight(strip); strip = next; haveStrip = true; }
-            previousIndex = i;
-        }
-        if (haveStrip) drawHighlight(strip);
+        });
         if ((dragging && boxMode) || recognizing) {
             SetBkMode(dc,TRANSPARENT);
-            HPEN pen = CreatePen(PS_DOT, 1, RGB(84, 209, 255)); auto oldPen = SelectObject(dc, pen), oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+            auto oldPen = SelectObject(dc, outlinePen), oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
             Rectangle(dc, selectionBox.left, selectionBox.top, selectionBox.right, selectionBox.bottom);
-            SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(pen);
+            SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
         }
         if (intersects(hud, damage)) {
         fill(dc, hud, RGB(17, 27, 40)); RECT stripe{hud.left, hud.top, hud.left + ui(4), hud.bottom}; fill(dc, stripe, RGB(66, 192, 245));
