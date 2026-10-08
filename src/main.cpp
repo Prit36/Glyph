@@ -21,11 +21,13 @@
 #include <cmath>
 #include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <map>
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <queue>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -251,12 +253,12 @@ SoftwareBitmap grayscaleTile(const Frame& frame, int x, int y, int w, int h) {
 }
 
 // Reuse Windows' exact grayscale conversion across passes. The cache belongs to
-// one region job and is capped at 1 MiB. Eligible crops convert in <=1 MiB
+// one region job and is capped at 16 MiB. Eligible crops convert in <=16 MiB
 // BGRA strips; larger crops fall back to the existing bounded OCR tiles.
 struct GrayImage {
     RECT region{};
     std::vector<uint8_t> pixels;
-    static constexpr size_t maxPixels = 1024 * 1024;
+    static constexpr size_t maxPixels = 16 * 1024 * 1024;
     template<typename Cancelled>
     static std::unique_ptr<GrayImage> create(const Frame& frame, RECT region, Cancelled cancelled) {
         int width = region.right - region.left, height = region.bottom - region.top;
@@ -497,14 +499,117 @@ OcrCandidate ocrCandidate(std::wstring text, winrt::Windows::Foundation::Rect r,
     return {Word{std::move(text), bounds, 0, monitor, {}}, margin <= 2, scale, margin};
 }
 
+OcrEngine createEngine(const std::wstring& language) {
+    OcrEngine engine{nullptr};
+    if (language == L"auto") {
+        engine = OcrEngine::TryCreateFromUserProfileLanguages();
+        if (!engine) {
+            auto available = OcrEngine::AvailableRecognizerLanguages();
+            if (available.Size()) engine = OcrEngine::TryCreateFromLanguage(available.GetAt(0));
+        }
+    } else engine = OcrEngine::TryCreateFromLanguage(winrt::Windows::Globalization::Language(language));
+    if (!engine) throw std::runtime_error("No matching Windows OCR language. Install its OCR language feature in Windows Settings, or choose an installed language from the tray menu.");
+    return engine;
+}
+
+class EnginePool {
+    std::wstring language;
+    std::mutex mtx;
+    std::vector<OcrEngine> pool;
+public:
+    explicit EnginePool(std::wstring lang = L"auto") : language(std::move(lang)) {}
+    void setLanguage(const std::wstring& lang) {
+        std::lock_guard lock(mtx);
+        if (language != lang) {
+            language = lang;
+            pool.clear();
+        }
+    }
+    OcrEngine acquire() {
+        std::lock_guard lock(mtx);
+        if (!pool.empty()) {
+            auto e = pool.back();
+            pool.pop_back();
+            return e;
+        }
+        return createEngine(language);
+    }
+    void release(OcrEngine e) {
+        std::lock_guard lock(mtx);
+        pool.push_back(std::move(e));
+    }
+    void clear() {
+        std::lock_guard lock(mtx);
+        pool.clear();
+    }
+};
+
+class ThreadPool {
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queueMutex;
+    std::condition_variable cv;
+    bool stop = false;
+public:
+    explicit ThreadPool(size_t threads) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this]() {
+                try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock lock(queueMutex);
+                        cv.wait(lock, [this]() { return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+    void enqueue(std::function<void()> task) {
+        {
+            std::unique_lock lock(queueMutex);
+            tasks.push(std::move(task));
+        }
+        cv.notify_one();
+    }
+    template<typename Cancelled>
+    void waitAll(size_t expectedTasks, std::atomic<size_t>& completed, Cancelled cancelled) {
+        while (completed.load() < expectedTasks && !cancelled()) {
+            std::this_thread::yield();
+        }
+    }
+    ~ThreadPool() {
+        {
+            std::unique_lock lock(queueMutex);
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto& w : workers) {
+            if (w.joinable()) w.join();
+        }
+    }
+};
+
 template<typename Cancelled>
-std::vector<Word> recognizeRegion(const Frame& frame, RECT region, int monitor, const OcrEngine& engine, int limit, Cancelled cancelled) {
-    std::vector<OcrCandidate> candidates;
-    std::unique_ptr<GrayImage> grayscale;
-    bool cacheAttempted = false;
-    // Native input, ordinary 2x enlargement, normalized 3x/4x crops, then a
-    // thresholded 4x pass restricted to gaps. The last pass cannot replace text.
+std::vector<Word> recognizeRegion(const Frame& frame, RECT region, int monitor, EnginePool& engines, ThreadPool& pool, int limit, Cancelled cancelled) {
+    auto grayscale = GrayImage::create(frame, region, cancelled);
+    if (cancelled()) return {};
+
+    struct TaskInfo {
+        RECT tile;
+        int scale;
+        bool enhance;
+        bool binary;
+        bool gapOnly;
+    };
+    std::vector<TaskInfo> tasks;
+
     for (int pass : {1, 2, 3, 4, 5}) {
+        if (cancelled()) return {};
         int scale = std::min(pass, 4);
         for (auto tile : ocrTiles(region.right - region.left, region.bottom - region.top, limit, scale)) {
             if (cancelled()) return {};
@@ -517,27 +622,66 @@ std::vector<Word> recognizeRegion(const Frame& frame, RECT region, int monitor, 
                 for (LONG x = tile.left; x < tile.right; ++x) if ((row[x] & 0xffffff) != first) { detail = true; break; }
             }
             if (!detail) continue;
-            bool cacheCancelled = false;
-            if (!cacheAttempted) {
-                grayscale = GrayImage::create(frame,region,[&] { cacheCancelled = cancelled(); return cacheCancelled; });
-                cacheAttempted = true;
-            }
-            if (cacheCancelled) return {};
-            if (cancelled()) return {};
-            auto bitmap = tileBitmap(frame, tile.left, tile.top, tile.right - tile.left, tile.bottom - tile.top, scale, scale >= 3, pass == 5, grayscale.get());
-            if (cancelled()) return {};
-            auto recognized = engine.RecognizeAsync(bitmap).get();
-            if (cancelled()) return {};
-            auto angle = recognized.TextAngle(); double degrees = angle ? angle.Value() : 0;
-            for (auto line : recognized.Lines()) for (auto item : line.Words()) {
-                auto candidate = ocrCandidate(item.Text().c_str(), item.BoundingRect(), tile, scale, monitor, degrees);
-                candidate.gapOnly = pass == 5;
-                const auto& w = candidate.word;
-                if (!w.text.empty() && w.rect.right > w.rect.left && w.rect.bottom > w.rect.top) candidates.push_back(std::move(candidate));
-            }
+
+            tasks.push_back({tile, scale, scale >= 3, pass == 5, pass == 5});
         }
     }
-    return mergeOcrCandidates(std::move(candidates));
+
+    if (tasks.empty() || cancelled()) return {};
+
+    std::vector<std::vector<OcrCandidate>> results(tasks.size());
+    std::atomic<size_t> completedCount{0};
+
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        pool.enqueue([&, i]() {
+            if (cancelled()) {
+                ++completedCount;
+                return;
+            }
+            auto engine = engines.acquire();
+            const auto& t = tasks[i];
+            auto bitmap = tileBitmap(frame, t.tile.left, t.tile.top,
+                                     t.tile.right - t.tile.left, t.tile.bottom - t.tile.top,
+                                     t.scale, t.enhance, t.binary, grayscale.get());
+            try {
+                if (!cancelled()) {
+                    auto recognized = engine.RecognizeAsync(bitmap).get();
+                    auto angle = recognized.TextAngle(); double degrees = angle ? angle.Value() : 0;
+                    for (auto line : recognized.Lines()) {
+                        for (auto item : line.Words()) {
+                            auto candidate = ocrCandidate(item.Text().c_str(), item.BoundingRect(), t.tile, t.scale, monitor, degrees);
+                            candidate.gapOnly = t.gapOnly;
+                            const auto& w = candidate.word;
+                            if (!w.text.empty() && w.rect.right > w.rect.left && w.rect.bottom > w.rect.top) {
+                                results[i].push_back(std::move(candidate));
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+            engines.release(std::move(engine));
+            ++completedCount;
+        });
+    }
+
+    pool.waitAll(tasks.size(), completedCount, cancelled);
+
+    if (cancelled()) return {};
+
+    std::vector<OcrCandidate> allCandidates;
+    for (auto& r : results) {
+        allCandidates.insert(allCandidates.end(), std::make_move_iterator(r.begin()), std::make_move_iterator(r.end()));
+    }
+
+    return mergeOcrCandidates(std::move(allCandidates));
+}
+
+template<typename Cancelled>
+std::vector<Word> recognizeRegion(const Frame& frame, RECT region, int monitor, const OcrEngine& engine, int limit, Cancelled cancelled) {
+    EnginePool engines;
+    engines.setLanguage(engine.RecognizerLanguage().LanguageTag().c_str());
+    ThreadPool pool(std::clamp<size_t>(std::thread::hardware_concurrency() > 2 ? std::thread::hardware_concurrency() / 2 : 2, 2, 4));
+    return recognizeRegion(frame, region, monitor, engines, pool, limit, cancelled);
 }
 
 // Native x64 includes SSE2. Blend four BGRA pixels per iteration directly into
@@ -574,21 +718,11 @@ void blendRect(Bitmap& destination, const Bitmap& source, RECT rect, uint32_t co
     }
 }
 
-OcrEngine createEngine(const std::wstring& language) {
-    OcrEngine engine{nullptr};
-    if (language == L"auto") {
-        engine = OcrEngine::TryCreateFromUserProfileLanguages();
-        if (!engine) {
-            auto available = OcrEngine::AvailableRecognizerLanguages();
-            if (available.Size()) engine = OcrEngine::TryCreateFromLanguage(available.GetAt(0));
-        }
-    } else engine = OcrEngine::TryCreateFromLanguage(winrt::Windows::Globalization::Language(language));
-    if (!engine) throw std::runtime_error("No matching Windows OCR language. Install its OCR language feature in Windows Settings, or choose an installed language from the tray menu.");
-    return engine;
-}
 
 class Worker {
     HWND window;
+    ThreadPool pool{std::clamp<size_t>(std::thread::hardware_concurrency() > 2 ? std::thread::hardware_concurrency() / 2 : 2, 2, 4)};
+    EnginePool engines;
     std::thread thread;
     std::mutex mutex;
     std::condition_variable wake;
@@ -613,12 +747,12 @@ private:
             auto info = std::make_unique<EngineInfo>(); info->error = L"Could not initialize Windows Runtime.";
             if (PostMessage(window, WM_ENGINE, 0, reinterpret_cast<LPARAM>(info.get()))) info.release(); return;
         }
-        OcrEngine engine{nullptr}; std::wstring engineLanguage;
         auto info = std::make_unique<EngineInfo>();
         try {
             for (auto language : OcrEngine::AvailableRecognizerLanguages())
                 info->languages.emplace_back(language.LanguageTag().c_str(), language.DisplayName().c_str());
-            engine = createEngine(L"auto"); engineLanguage = L"auto";
+            auto testEngine = engines.acquire();
+            engines.release(std::move(testEngine));
         } catch (winrt::hresult_error const& e) { info->error = e.message().c_str(); }
         catch (const std::exception& e) { info->error = widen(e); }
         if (PostMessage(window, WM_ENGINE, 0, reinterpret_cast<LPARAM>(info.get()))) info.release();
@@ -629,9 +763,11 @@ private:
             if (generation != job.id) continue;
             auto result = std::make_unique<Result>(); result->id = job.id;
             try {
-                if (!engine || engineLanguage != job.language) { engine = createEngine(job.language); engineLanguage = job.language; }
-                result->language = engine.RecognizerLanguage().LanguageTag().c_str();
+                engines.setLanguage(job.language);
+                auto currentEngine = engines.acquire();
+                result->language = currentEngine.RecognizerLanguage().LanguageTag().c_str();
                 int limit = static_cast<int>(OcrEngine::MaxImageDimension());
+                engines.release(std::move(currentEngine));
                 if (limit <= 128) throw std::runtime_error("Windows reported an invalid OCR image limit");
                 int nextLine = 0;
                 for (size_t index = 0; index < job.frame->monitors.size(); ++index) {
@@ -642,7 +778,7 @@ private:
                     // may extend outside it, including on mixed/negative monitors.
                     RECT bounds{0, 0, job.frame->image->width, job.frame->image->height};
                     if (!IntersectRect(&region, &job.region, &monitor) || !IntersectRect(&region, &region, &bounds)) continue;
-                    auto words = recognizeRegion(*job.frame, region, monitorIndex, engine, limit, [&] { return generation != job.id; });
+                    auto words = recognizeRegion(*job.frame, region, monitorIndex, engines, pool, limit, [&] { return generation != job.id; });
                     if (generation != job.id) break;
                     // Group fragments from tile seams into visual rows, then order words within each row.
                     std::stable_sort(words.begin(), words.end(), [](const Word& a, const Word& b) { return a.rect.top < b.rect.top; });
@@ -676,7 +812,7 @@ private:
             }
             job.frame.reset();
         }
-        engine = nullptr; winrt::uninit_apartment();
+        engines.clear(); winrt::uninit_apartment();
     }
 };
 
