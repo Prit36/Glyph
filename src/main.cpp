@@ -14,6 +14,8 @@
 #include <winrt/Windows.Graphics.Imaging.h>
 #include <winrt/Windows.Media.Ocr.h>
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -26,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace winrt::Windows::Media::Ocr;
@@ -78,7 +81,7 @@ public:
     void clear() { for (auto [size, font] : fonts) DeleteObject(font); fonts.clear(); }
 };
 struct Settings { std::wstring hotkey = L"Ctrl+Alt+T", language = L"auto"; UINT modifiers = MOD_CONTROL | MOD_ALT, key = 'T'; };
-struct Job { uint64_t id{}; std::shared_ptr<Frame> frame; std::wstring language; Clock::time_point started; };
+struct Job { uint64_t id{}; std::shared_ptr<Frame> frame; RECT region{}; std::wstring language; Clock::time_point started; };
 struct Result { uint64_t id{}; std::vector<Word> words; std::wstring error, language; bool complete{}; int elapsed{}; };
 struct EngineInfo { std::vector<std::pair<std::wstring, std::wstring>> languages; std::wstring error; };
 
@@ -94,6 +97,19 @@ bool intersects(RECT a, RECT b) { RECT out{}; return IntersectRect(&out, &a, &b)
 int length(const Word& w) { return static_cast<int>(w.text.size()); }
 bool high(wchar_t c) { return c >= 0xD800 && c <= 0xDBFF; }
 bool low(wchar_t c) { return c >= 0xDC00 && c <= 0xDFFF; }
+
+RECT dragRegion(POINT start, POINT end, int width, int height) {
+    start.x = std::clamp(start.x, 0L, static_cast<LONG>(width)); end.x = std::clamp(end.x, 0L, static_cast<LONG>(width));
+    start.y = std::clamp(start.y, 0L, static_cast<LONG>(height)); end.y = std::clamp(end.y, 0L, static_cast<LONG>(height));
+    return {std::min(start.x, end.x), std::min(start.y, end.y), std::max(start.x, end.x), std::max(start.y, end.y)};
+}
+
+std::array<RECT,4> outlineRects(RECT r) {
+    if (IsRectEmpty(&r)) return {};
+    InflateRect(&r,2,2);
+    return {RECT{r.left,r.top,r.right,r.top + 4}, RECT{r.left,r.bottom - 4,r.right,r.bottom},
+        RECT{r.left,r.top,r.left + 4,r.bottom}, RECT{r.right - 4,r.top,r.right,r.bottom}};
+}
 
 std::shared_ptr<Frame> capture() {
     auto frame = std::make_shared<Frame>();
@@ -120,49 +136,318 @@ std::shared_ptr<Frame> capture() {
     return frame;
 }
 
-// Keep native resolution. Windows converts the OCR input to Gray8; the overlay
-// continues to use the original, full-color screenshot.
-SoftwareBitmap tileBitmap(const Frame& frame, int x, int y, int w, int h) {
-    SoftwareBitmap bitmap(BitmapPixelFormat::Bgra8, w, h, BitmapAlphaMode::Ignore);
+SoftwareBitmap grayscaleTile(const Frame& frame, int x, int y, int w, int h) {
+    SoftwareBitmap native(BitmapPixelFormat::Bgra8, w, h, BitmapAlphaMode::Ignore);
+    {
+        auto buffer = native.LockBuffer(BitmapBufferAccessMode::Write);
+        auto reference = buffer.CreateReference();
+        auto access = reference.as<::Windows::Foundation::IMemoryBufferByteAccess>();
+        BYTE* dest{}; UINT32 capacity{}; winrt::check_hresult(access->GetBuffer(&dest, &capacity));
+        auto plane = buffer.GetPlaneDescription(0);
+        if (plane.StartIndex < 0 || plane.Stride < w * 4 || static_cast<uint64_t>(plane.StartIndex) + static_cast<uint64_t>(h - 1) * plane.Stride + static_cast<uint64_t>(w) * 4 > capacity)
+            throw std::runtime_error("Windows returned an invalid OCR pixel buffer");
+        auto source = static_cast<const uint8_t*>(frame.image->pixels);
+        for (int row = 0; row < h; ++row)
+            memcpy(dest + plane.StartIndex + static_cast<size_t>(row) * plane.Stride,
+                source + (static_cast<size_t>(y + row) * frame.image->width + x) * 4, static_cast<size_t>(w) * 4);
+    }
+    return SoftwareBitmap::Convert(native, BitmapPixelFormat::Gray8);
+}
+
+// Reuse Windows' exact grayscale conversion across passes. The cache belongs to
+// one region job and is capped at 1 MiB. Eligible crops convert in <=1 MiB
+// BGRA strips; larger crops fall back to the existing bounded OCR tiles.
+struct GrayImage {
+    RECT region{};
+    std::vector<uint8_t> pixels;
+    static constexpr size_t maxPixels = 1024 * 1024;
+    template<typename Cancelled>
+    static std::unique_ptr<GrayImage> create(const Frame& frame, RECT region, Cancelled cancelled) {
+        int width = region.right - region.left, height = region.bottom - region.top;
+        if (width <= 0 || height <= 0 || static_cast<size_t>(width) * height > maxPixels || region.left < 0 || region.top < 0 || region.right > frame.image->width || region.bottom > frame.image->height) return {};
+        auto image = std::make_unique<GrayImage>(); image->region = region;
+        image->pixels.resize(static_cast<size_t>(width) * height);
+        int rows = std::max(1, 262144 / width);
+        for (int y = 0; y < height; y += rows) {
+            if (cancelled()) return {};
+            int count = std::min(rows, height - y);
+            auto bitmap = grayscaleTile(frame,region.left,region.top + y,width,count);
+            auto buffer = bitmap.LockBuffer(BitmapBufferAccessMode::Read); auto reference = buffer.CreateReference();
+            BYTE* source{}; UINT32 capacity{};
+            winrt::check_hresult(reference.as<::Windows::Foundation::IMemoryBufferByteAccess>()->GetBuffer(&source,&capacity));
+            auto plane = buffer.GetPlaneDescription(0);
+            if (plane.StartIndex < 0 || plane.Stride < width || static_cast<uint64_t>(plane.StartIndex) + static_cast<uint64_t>(count - 1) * plane.Stride + width > capacity)
+                throw std::runtime_error("Windows returned an invalid grayscale pixel buffer");
+            for (int row = 0; row < count; ++row)
+                memcpy(image->pixels.data() + static_cast<size_t>(y + row) * width,
+                    source + plane.StartIndex + static_cast<size_t>(row) * plane.Stride,width);
+        }
+        return image;
+    }
+};
+
+// Build OCR input separately from the immutable screenshot. Bilinear enlargement
+// gives small desktop fonts another chance without changing selection coordinates.
+SoftwareBitmap tileBitmap(const Frame& frame, int x, int y, int w, int h, int scale = 1, bool enhance = false, bool binary = false, const GrayImage* cached = nullptr) {
+    SoftwareBitmap grayscale{nullptr};
+    if (cached && scale == 1 && !enhance) {
+        grayscale = SoftwareBitmap(BitmapPixelFormat::Gray8,w,h,BitmapAlphaMode::Ignore);
+        auto buffer = grayscale.LockBuffer(BitmapBufferAccessMode::Write); auto reference = buffer.CreateReference();
+        BYTE* dest{}; UINT32 capacity{};
+        winrt::check_hresult(reference.as<::Windows::Foundation::IMemoryBufferByteAccess>()->GetBuffer(&dest,&capacity));
+        auto plane = buffer.GetPlaneDescription(0);
+        if (plane.StartIndex < 0 || plane.Stride < w || static_cast<uint64_t>(plane.StartIndex) + static_cast<uint64_t>(h - 1) * plane.Stride + w > capacity)
+            throw std::runtime_error("Windows returned an invalid grayscale pixel buffer");
+        int width = cached->region.right - cached->region.left;
+        for (int row = 0; row < h; ++row)
+            memcpy(dest + plane.StartIndex + static_cast<size_t>(row) * plane.Stride,
+                cached->pixels.data() + static_cast<size_t>(y - cached->region.top + row) * width + x - cached->region.left,w);
+    } else if (!cached) grayscale = grayscaleTile(frame,x,y,w,h);
+    if (scale == 1 && !enhance) return grayscale;
+    BitmapBuffer inputBuffer{nullptr};
+    winrt::Windows::Foundation::IMemoryBufferReference inputReference{nullptr};
+    BitmapPlaneDescription inputPlane{};
+    const BYTE* input{};
+    if (cached) {
+        input = cached->pixels.data(); inputPlane.Stride = cached->region.right - cached->region.left;
+        inputPlane.StartIndex = (y - cached->region.top) * inputPlane.Stride + x - cached->region.left;
+    } else {
+        inputBuffer = grayscale.LockBuffer(BitmapBufferAccessMode::Read); inputReference = inputBuffer.CreateReference();
+        BYTE* pixels{}; UINT32 capacity{};
+        winrt::check_hresult(inputReference.as<::Windows::Foundation::IMemoryBufferByteAccess>()->GetBuffer(&pixels,&capacity));
+        input = pixels; inputPlane = inputBuffer.GetPlaneDescription(0);
+        if (inputPlane.StartIndex < 0 || inputPlane.Stride < w || static_cast<uint64_t>(inputPlane.StartIndex) + static_cast<uint64_t>(h - 1) * inputPlane.Stride + w > capacity)
+            throw std::runtime_error("Windows returned an invalid grayscale pixel buffer");
+    }
+    SoftwareBitmap bitmap(BitmapPixelFormat::Gray8, w * scale, h * scale, BitmapAlphaMode::Ignore);
     auto buffer = bitmap.LockBuffer(BitmapBufferAccessMode::Write);
     auto reference = buffer.CreateReference();
     auto access = reference.as<::Windows::Foundation::IMemoryBufferByteAccess>();
     BYTE* dest{}; UINT32 capacity{}; winrt::check_hresult(access->GetBuffer(&dest, &capacity));
     auto plane = buffer.GetPlaneDescription(0);
-    if (plane.StartIndex < 0 || plane.Stride < w * 4 || static_cast<uint64_t>(plane.StartIndex) + static_cast<uint64_t>(h - 1) * plane.Stride + static_cast<uint64_t>(w) * 4 > capacity)
+    if (plane.StartIndex < 0 || plane.Stride < w * scale || static_cast<uint64_t>(plane.StartIndex) + static_cast<uint64_t>(h * scale - 1) * plane.Stride + static_cast<uint64_t>(w * scale) > capacity)
         throw std::runtime_error("Windows returned an invalid OCR pixel buffer");
-    auto source = static_cast<const uint8_t*>(frame.image->pixels);
-    for (int row = 0; row < h; ++row)
-        memcpy(dest + plane.StartIndex + static_cast<size_t>(row) * plane.Stride,
-               source + (static_cast<size_t>(y + row) * frame.image->width + x) * 4, static_cast<size_t>(w) * 4);
-    reference.Close(); buffer.Close(); return SoftwareBitmap::Convert(bitmap, BitmapPixelFormat::Gray8);
+    std::array<uint8_t, 256> tone{};
+    std::iota(tone.begin(), tone.end(), uint8_t{0});
+    if (enhance) {
+        std::array<size_t, 256> histogram{};
+        for (int row = 0; row < h; ++row) for (int col = 0; col < w; ++col)
+            ++histogram[input[inputPlane.StartIndex + static_cast<size_t>(row) * inputPlane.Stride + col]];
+        size_t count = static_cast<size_t>(w) * h, tail = count / 1000, sum = 0;
+        int lo = 0, hi = 255, median = 0;
+        for (; lo < 255 && sum + histogram[lo] <= tail; ++lo) sum += histogram[lo];
+        sum = 0; for (; hi > lo && sum + histogram[hi] <= tail; --hi) sum += histogram[hi];
+        sum = 0; for (; median < 255 && sum + histogram[median] < count / 2; ++median) sum += histogram[median];
+        if (hi - lo >= 8) for (int value = 0; value < 256; ++value) {
+            int stretched = std::clamp((value - lo) * 255 / (hi - lo), 0, 255);
+            tone[value] = static_cast<uint8_t>(median < (lo + hi) / 2 ? 255 - stretched : stretched);
+            if (binary) tone[value] = tone[value] < 160 ? 0 : 255;
+        }
+    }
+    // Separable integer interpolation preserves the bilinear filter while
+    // reusing horizontal rows instead of resampling four pixels per output.
+    int denominator = scale * 2, divisor = denominator * denominator;
+    struct Column { int first, second, weight; };
+    std::vector<Column> columns(static_cast<size_t>(w) * scale);
+    for (int col = 0; col < w * scale; ++col) {
+        int position = std::clamp(col * 2 + 1 - scale, 0, (w - 1) * denominator);
+        int first = position / denominator;
+        columns[col] = {first, std::min(first + 1, w - 1), position % denominator};
+    }
+    std::vector<int> topRow(columns.size()), bottomRow(columns.size());
+    auto horizontal = [&](int row, std::vector<int>& values) {
+        const auto source = input + inputPlane.StartIndex + static_cast<size_t>(row) * inputPlane.Stride;
+        for (size_t col = 0; col < columns.size(); ++col) {
+            const auto& c = columns[col];
+            values[col] = tone[source[c.first]] * (denominator - c.weight) + tone[source[c.second]] * c.weight;
+        }
+    };
+    int cachedTop = -1, cachedBottom = -1;
+    for (int row = 0; row < h * scale; ++row) {
+        auto output = dest + plane.StartIndex + static_cast<size_t>(row) * plane.Stride;
+        int position = std::clamp(row * 2 + 1 - scale, 0, (h - 1) * denominator);
+        int y0 = position / denominator, y1 = std::min(y0 + 1, h - 1), fy = position % denominator;
+        if (y0 != cachedTop) {
+            if (y0 == cachedBottom) { topRow.swap(bottomRow); cachedBottom = -1; }
+            else horizontal(y0, topRow);
+            cachedTop = y0;
+        }
+        if (y1 != cachedBottom) { horizontal(y1, bottomRow); cachedBottom = y1; }
+        auto write = [&]<int Divisor>() {
+            for (size_t col = 0; col < columns.size(); ++col)
+                output[col] = static_cast<uint8_t>((topRow[col] * (denominator - fy) + bottomRow[col] * fy + Divisor / 2) / Divisor);
+        };
+        if (scale == 2) write.template operator()<16>();
+        else if (scale == 3) write.template operator()<36>();
+        else if (scale == 4) write.template operator()<64>();
+        else for (size_t col = 0; col < columns.size(); ++col)
+            output[col] = static_cast<uint8_t>((topRow[col] * (denominator - fy) + bottomRow[col] * fy + divisor / 2) / divisor);
+    }
+    reference.Close(); buffer.Close(); return bitmap;
 }
 
-// Trim only complete, exactly uniform border rows, leaving generous context.
-// No thresholding, scaling, or removal of nonuniform pixels is involved.
-std::pair<int, int> uniformBorder(const Frame& frame, RECT monitor) {
-    int width = monitor.right - monitor.left, height = monitor.bottom - monitor.top;
-    int ox = monitor.left - frame.desktop.left, oy = monitor.top - frame.desktop.top;
-    auto pixels = static_cast<const uint32_t*>(frame.image->pixels);
-    auto uniform = [&](int y, uint32_t color) {
-        auto row = pixels + static_cast<size_t>(oy + y) * frame.image->width + ox;
-        for (int x = 0; x < width; ++x) if ((row[x] & 0xffffff) != color) return false;
-        return true;
+struct OcrCandidate { Word word; bool clipped{}; int scale{}, margin{}; unsigned votes{}; bool gapOnly{}; };
+
+bool sameOcrPosition(RECT a, RECT b) {
+    RECT overlap{};
+    if (!IntersectRect(&overlap, &a, &b)) return false;
+    LONG minWidth = std::min(a.right - a.left, b.right - b.left);
+    LONG minHeight = std::min(a.bottom - a.top, b.bottom - b.top);
+    return (overlap.right - overlap.left) * 2 > minWidth && (overlap.bottom - overlap.top) * 2 > minHeight;
+}
+
+std::vector<RECT> ocrTiles(int width, int height, int limit, int scale) {
+    // The budget applies to the enlarged bitmap too. Balance both axes so the
+    // last tile cannot be a narrow sliver with too little recognition context.
+    constexpr int pixelBudget = 5 * 1024 * 1024;
+    int maximumWidth = std::min({width, limit / scale, scale >= 3 ? 768 : width});
+    int maximumHeight = std::min({limit / scale, pixelBudget / (maximumWidth * scale * scale), scale >= 3 ? 384 : height});
+    int overlap = std::min(80, std::min(maximumWidth, maximumHeight) / 4);
+    auto dimension = [&](int size, int maximum) {
+        int count = std::max(1, (size - overlap + maximum - overlap - 1) / (maximum - overlap));
+        return std::min(maximum, (size + overlap * (count - 1) + count - 1) / count);
     };
-    int top = 0, bottom = height;
-    uint32_t first = pixels[static_cast<size_t>(oy) * frame.image->width + ox] & 0xffffff;
-    while (top < height && uniform(top, first)) ++top;
-    uint32_t last = pixels[static_cast<size_t>(oy + height - 1) * frame.image->width + ox] & 0xffffff;
-    while (bottom > top && uniform(bottom - 1, last)) --bottom;
-    constexpr int context = 48;
-    top = std::max(0, top - context); bottom = std::min(height, std::max(bottom, top + context) + context);
-    return {top, bottom};
+    int tw = dimension(width, maximumWidth), th = dimension(height, maximumHeight);
+    std::vector<RECT> tiles;
+    for (int y = 0;; y += th - overlap) {
+        for (int x = 0;; x += tw - overlap) {
+            tiles.push_back({x, y, std::min(x + tw, width), std::min(y + th, height)});
+            if (x + tw >= width) break;
+        }
+        if (y + th >= height) break;
+    }
+    return tiles;
+}
+
+class OcrPositionIndex {
+    std::unordered_map<uint64_t,std::vector<size_t>> cells;
+    static uint64_t key(LONG x, LONG y) { return static_cast<uint64_t>(static_cast<uint32_t>(y)) << 32 | static_cast<uint32_t>(x); }
+public:
+    void add(RECT r, size_t index) {
+        for (LONG y = r.top / 32; y <= (r.bottom - 1) / 32; ++y)
+            for (LONG x = r.left / 128; x <= (r.right - 1) / 128; ++x) cells[key(x,y)].push_back(index);
+    }
+    template<typename Match>
+    bool any(RECT r, Match match) const {
+        for (LONG y = r.top / 32; y <= (r.bottom - 1) / 32; ++y)
+            for (LONG x = r.left / 128; x <= (r.right - 1) / 128; ++x) {
+                auto found = cells.find(key(x,y)); if (found == cells.end()) continue;
+                for (size_t index : found->second) if (match(index)) return true;
+            }
+        return false;
+    }
+};
+
+std::vector<Word> mergeOcrCandidates(std::vector<OcrCandidate> candidates) {
+    OcrPositionIndex evidence;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        auto& candidate = candidates[i]; const auto& r = candidate.word.rect;
+        candidate.votes = 1u << candidate.scale;
+        evidence.add(r,i);
+    }
+    for (auto& candidate : candidates) {
+        const auto& r = candidate.word.rect;
+        evidence.any(r,[&](size_t index) {
+            const auto& other = candidates[index];
+            if (!other.gapOnly && candidate.scale != other.scale && sameOcrPosition(r, other.word.rect) &&
+                CompareStringOrdinal(candidate.word.text.c_str(), -1, other.word.text.c_str(), -1, TRUE) == CSTR_EQUAL)
+                candidate.votes |= 1u << other.scale;
+            return false;
+        });
+    }
+    // Prefer complete readings confirmed at different scales. Duplicate tiles
+    // at the same scale are one vote, not extra evidence. Preserve native results
+    // on ties for normal-size text; stronger enlargement helps tiny glyphs.
+    std::stable_sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        if (a.gapOnly != b.gapOnly) return !a.gapOnly;
+        if (a.clipped != b.clipped) return !a.clipped;
+        if (std::popcount(a.votes) != std::popcount(b.votes)) return std::popcount(a.votes) > std::popcount(b.votes);
+        auto preference = [](const auto& candidate) {
+            return candidate.word.rect.bottom - candidate.word.rect.top < 14 ? 4 - candidate.scale : candidate.scale;
+        };
+        if (preference(a) != preference(b)) return preference(a) < preference(b);
+        if (a.scale != b.scale) return a.scale < b.scale;
+        return a.margin > b.margin;
+    });
+    std::vector<Word> words;
+    // Index both axes so long text rows do not require quadratic comparisons.
+    OcrPositionIndex accepted;
+    for (auto& candidate : candidates) {
+        const RECT& r = candidate.word.rect;
+        bool duplicate = accepted.any(r,[&](size_t index) { return sameOcrPosition(words[index].rect,r); });
+        if (duplicate) continue;
+        accepted.add(r,words.size());
+        words.push_back(std::move(candidate.word));
+    }
+    return words;
+}
+
+OcrCandidate ocrCandidate(std::wstring text, winrt::Windows::Foundation::Rect r, RECT tile, int scale, int monitor, double degrees = 0) {
+    // Windows returns boxes in its deskewed image. Rotate all four corners back
+    // around the tile center before comparing passes or placing selections.
+    double angle = degrees * 0.017453292519943295, cosine = std::cos(angle), sine = std::sin(angle);
+    double cx = (tile.right - tile.left) / 2.0, cy = (tile.bottom - tile.top) / 2.0;
+    double left = 1e30, top = 1e30, right = -1e30, bottom = -1e30;
+    for (double x : {static_cast<double>(r.X) / scale, static_cast<double>(r.X + r.Width) / scale})
+        for (double y : {static_cast<double>(r.Y) / scale, static_cast<double>(r.Y + r.Height) / scale}) {
+            double px = cx + (x - cx) * cosine - (y - cy) * sine;
+            double py = cy + (x - cx) * sine + (y - cy) * cosine;
+            left = std::min(left, px); top = std::min(top, py); right = std::max(right, px); bottom = std::max(bottom, py);
+        }
+    RECT bounds{tile.left + static_cast<LONG>(std::floor(left)), tile.top + static_cast<LONG>(std::floor(top)),
+        tile.left + static_cast<LONG>(std::ceil(right)), tile.top + static_cast<LONG>(std::ceil(bottom))};
+    IntersectRect(&bounds, &bounds, &tile);
+    int margin = static_cast<int>(std::min({bounds.left - tile.left, bounds.top - tile.top, tile.right - bounds.right, tile.bottom - bounds.bottom}));
+    return {Word{std::move(text), bounds, 0, monitor, {}}, margin <= 2, scale, margin};
+}
+
+template<typename Cancelled>
+std::vector<Word> recognizeRegion(const Frame& frame, RECT region, int monitor, const OcrEngine& engine, int limit, Cancelled cancelled) {
+    std::vector<OcrCandidate> candidates;
+    std::unique_ptr<GrayImage> grayscale;
+    bool cacheAttempted = false;
+    // Native input, ordinary 2x enlargement, normalized 3x/4x crops, then a
+    // thresholded 4x pass restricted to gaps. The last pass cannot replace text.
+    for (int pass : {1, 2, 3, 4, 5}) {
+        int scale = std::min(pass, 4);
+        for (auto tile : ocrTiles(region.right - region.left, region.bottom - region.top, limit, scale)) {
+            if (cancelled()) return {};
+            OffsetRect(&tile, region.left, region.top);
+            auto pixels = static_cast<const uint32_t*>(frame.image->pixels);
+            uint32_t first = pixels[static_cast<size_t>(tile.top) * frame.image->width + tile.left] & 0xffffff;
+            bool detail = false;
+            for (LONG y = tile.top; y < tile.bottom && !detail; ++y) {
+                auto row = pixels + static_cast<size_t>(y) * frame.image->width;
+                for (LONG x = tile.left; x < tile.right; ++x) if ((row[x] & 0xffffff) != first) { detail = true; break; }
+            }
+            if (!detail) continue;
+            bool cacheCancelled = false;
+            if (!cacheAttempted) {
+                grayscale = GrayImage::create(frame,region,[&] { cacheCancelled = cancelled(); return cacheCancelled; });
+                cacheAttempted = true;
+            }
+            if (cacheCancelled) return {};
+            if (cancelled()) return {};
+            auto bitmap = tileBitmap(frame, tile.left, tile.top, tile.right - tile.left, tile.bottom - tile.top, scale, scale >= 3, pass == 5, grayscale.get());
+            if (cancelled()) return {};
+            auto recognized = engine.RecognizeAsync(bitmap).get();
+            if (cancelled()) return {};
+            auto angle = recognized.TextAngle(); double degrees = angle ? angle.Value() : 0;
+            for (auto line : recognized.Lines()) for (auto item : line.Words()) {
+                auto candidate = ocrCandidate(item.Text().c_str(), item.BoundingRect(), tile, scale, monitor, degrees);
+                candidate.gapOnly = pass == 5;
+                const auto& w = candidate.word;
+                if (!w.text.empty() && w.rect.right > w.rect.left && w.rect.bottom > w.rect.top) candidates.push_back(std::move(candidate));
+            }
+        }
+    }
+    return mergeOcrCandidates(std::move(candidates));
 }
 
 // Native x64 includes SSE2. Blend four BGRA pixels per iteration directly into
 // the existing canvas, avoiding full-screen GDI fills and AlphaBlend surfaces.
 // Original screenshot pixels stay immutable for OCR and crisp selected text.
-void blendRect(Bitmap& destination, const Bitmap& source, RECT rect, uint32_t color, int alpha) {
+void blendRect(Bitmap& destination, const Bitmap& source, RECT rect, uint32_t color, int alpha, POINT origin = {}) {
     __m128i zero = _mm_setzero_si128(), ones = _mm_set1_epi16(1);
     __m128i weight = _mm_set1_epi16(static_cast<short>(255 - alpha));
     __m128i colors = _mm_unpacklo_epi8(_mm_set1_epi32(static_cast<int>(color)), zero);
@@ -174,11 +459,12 @@ void blendRect(Bitmap& destination, const Bitmap& source, RECT rect, uint32_t co
     auto from = static_cast<const uint32_t*>(source.pixels); auto to = static_cast<uint32_t*>(destination.pixels);
     for (LONG y = rect.top; y < rect.bottom; ++y) {
         size_t offset = static_cast<size_t>(y) * source.width + rect.left;
+        size_t target = static_cast<size_t>(y - origin.y) * destination.width + rect.left - origin.x;
         LONG width = rect.right - rect.left, x = 0;
         for (; x + 4 <= width; x += 4) {
             __m128i pixels = _mm_loadu_si128(reinterpret_cast<const __m128i*>(from + offset + x));
             __m128i result = _mm_packus_epi16(blend(_mm_unpacklo_epi8(pixels, zero)), blend(_mm_unpackhi_epi8(pixels, zero)));
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(to + offset + x), result);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(to + target + x), result);
         }
         for (; x < width; ++x) {
             uint32_t pixel = from[offset + x], output = 0;
@@ -187,7 +473,7 @@ void blendRect(Bitmap& destination, const Bitmap& source, RECT rect, uint32_t co
                 int value = ((pixel >> shift) & 255) * (255 - alpha) + ((color >> shift) & 255) * alpha + 128;
                 output |= static_cast<uint32_t>((value + (value >> 8) + 1) >> 8) << shift;
             }
-            to[offset + x] = output;
+            to[target + x] = output;
         }
     }
 }
@@ -251,43 +537,16 @@ private:
                 result->language = engine.RecognizerLanguage().LanguageTag().c_str();
                 int limit = static_cast<int>(OcrEngine::MaxImageDimension());
                 if (limit <= 128) throw std::runtime_error("Windows reported an invalid OCR image limit");
-                int nextLine = 0, monitorIndex = 0;
-                for (auto monitor : job.frame->monitors) {
-                    std::vector<Word> words;
-                    auto [cropTop, cropBottom] = uniformBorder(*job.frame, monitor);
-                    int width = monitor.right - monitor.left, height = cropBottom - cropTop;
-                    // Bound Windows OCR's temporary image memory, not the source
-                    // resolution. Full-width strips preserve horizontal text context.
-                    constexpr int pixelBudget = 5 * 1024 * 1024;
-                    const int overlap = 80;
-                    const int maximumHeight = std::min(limit, std::max(128, pixelBudget / std::min(limit, width)));
-                    const int stripCount = std::max(1, (height - overlap + maximumHeight - overlap - 1) / (maximumHeight - overlap));
-                    const int tileHeight = std::min(maximumHeight, (height + overlap * (stripCount - 1) + stripCount - 1) / stripCount);
-                    const int stepX = limit - overlap, stepY = std::max(1, tileHeight - overlap);
-                    for (int y = 0; y < height && generation == job.id; y += stepY) {
-                        for (int x = 0; x < width && generation == job.id; x += stepX) {
-                            int tw = std::min(limit, width - x), th = std::min(tileHeight, height - y);
-                            int ox = monitor.left - job.frame->desktop.left + x, oy = monitor.top - job.frame->desktop.top + cropTop + y;
-                            auto bitmap = tileBitmap(*job.frame, ox, oy, tw, th);
-                            auto recognized = engine.RecognizeAsync(bitmap).get();
-                            if (generation != job.id) break;
-                            for (auto line : recognized.Lines()) {
-                                for (auto item : line.Words()) {
-                                    auto r = item.BoundingRect();
-                                    Word w{item.Text().c_str(), {ox + static_cast<int>(std::floor(r.X)), oy + static_cast<int>(std::floor(r.Y)),
-                                        ox + static_cast<int>(std::ceil(r.X + r.Width)), oy + static_cast<int>(std::ceil(r.Y + r.Height))}, nextLine, monitorIndex, {}};
-                                    // Assign overlap to the tile containing the word's center, so every word appears once.
-                                    double cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2;
-                                    if ((x > 0 && cx < overlap / 2) || (y > 0 && cy < overlap / 2) ||
-                                        (x + tw < width && cx >= tw - overlap / 2) || (y + th < height && cy >= th - overlap / 2)) continue;
-                                    if (!w.text.empty() && w.rect.right > w.rect.left && w.rect.bottom > w.rect.top) words.push_back(std::move(w));
-                                }
-                                ++nextLine;
-                            }
-                            if (x + tw >= width) break;
-                        }
-                        if (y + std::min(tileHeight, height - y) >= height) break;
-                    }
+                int nextLine = 0;
+                for (size_t index = 0; index < job.frame->monitors.size(); ++index) {
+                    int monitorIndex = static_cast<int>(index);
+                    RECT monitor = job.frame->monitors[index], region{};
+                    OffsetRect(&monitor, -job.frame->desktop.left, -job.frame->desktop.top);
+                    // Jobs contain an explicit image-coordinate crop. No OCR input
+                    // may extend outside it, including on mixed/negative monitors.
+                    RECT bounds{0, 0, job.frame->image->width, job.frame->image->height};
+                    if (!IntersectRect(&region, &job.region, &monitor) || !IntersectRect(&region, &region, &bounds)) continue;
+                    auto words = recognizeRegion(*job.frame, region, monitorIndex, engine, limit, [&] { return generation != job.id; });
                     if (generation != job.id) break;
                     // Group fragments from tile seams into visual rows, then order words within each row.
                     std::stable_sort(words.begin(), words.end(), [](const Word& a, const Word& b) { return a.rect.top < b.rect.top; });
@@ -302,19 +561,14 @@ private:
                             double centerA = (anchor.top + anchor.bottom) / 2.0, centerB = (w.rect.top + w.rect.bottom) / 2.0;
                             if (std::abs(centerA - centerB) <= std::max(3.0, std::min(anchor.bottom - anchor.top, w.rect.bottom - w.rect.top) * .45)) break;
                         }
-                        if (row == rows.rend()) rows.push_back({std::move(w)}); else row->push_back(std::move(w));
+                        if (row == rows.rend()) { rows.emplace_back(); rows.back().push_back(std::move(w)); }
+                        else row->push_back(std::move(w));
                     }
+                    result->words.reserve(result->words.size() + words.size());
                     for (auto& row : rows) {
                         std::stable_sort(row.begin(), row.end(), [](const Word& a, const Word& b) { return a.rect.left < b.rect.left; });
                         int line = nextLine++;
                         for (auto& w : row) { w.line = line; result->words.push_back(std::move(w)); }
-                    }
-                    ++monitorIndex;
-                    if (monitorIndex < static_cast<int>(job.frame->monitors.size()) && !result->words.empty() && generation == job.id) {
-                        auto partial = std::make_unique<Result>(); partial->id = result->id; partial->language = result->language;
-                        partial->words = std::move(result->words);
-                        partial->elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - job.started).count());
-                        send(std::move(partial));
                     }
                 }
             } catch (winrt::hresult_error const& e) { result->error = e.message().c_str(); }
@@ -347,7 +601,7 @@ public:
     HDC renderDc{};
     HGDIOBJ previousCanvas{};
     HICON icon{};
-    bool active{}, recognizing{}, dragging{}, boxMode{}, quitting{};
+    bool active{}, recognizing{}, dragging{}, boxMode{}, addRegion{}, quitting{};
     bool hotkeyRegistered{};
     uint64_t session{};
     int anchorWord{-1}, anchorCharacter{}, elapsed{};
@@ -363,6 +617,15 @@ public:
         if (renderDc) { SelectObject(renderDc, previousCanvas); DeleteDC(renderDc); renderDc = nullptr; }
         canvas.reset();
     }
+    void allocateCanvas() {
+        releaseCanvas();
+        // A bounded strip buffer replaces the second desktop-sized bitmap.
+        // Painting uses global logical coordinates with a translated viewport.
+        canvas = std::make_unique<Bitmap>(std::min(frame->image->width,4096),std::min(frame->image->height,256));
+        renderDc = CreateCompatibleDC(nullptr);
+        if (!renderDc) throw std::runtime_error("Cannot create overlay render device");
+        previousCanvas = SelectObject(renderDc,canvas->handle);
+    }
     int ui(int value) const { return static_cast<int>(std::lround(value * uiScale)); }
     void invalidate() {
         if (!active) return;
@@ -374,6 +637,7 @@ public:
         if (!IntersectRect(&clipped, &bounds, &area)) return;
         InvalidateRect(window, &clipped, FALSE);
     }
+    void invalidateOutline(RECT area) { for (auto edge : outlineRects(area)) invalidate(edge); }
     void notify(const std::wstring& text, bool error = false) {
         NOTIFYICONDATA n{sizeof(n)}; n.hWnd = window; n.uID = 1; n.uFlags = NIF_INFO;
         wcscpy_s(n.szInfoTitle, APP_NAME); wcsncpy_s(n.szInfo, text.c_str(), _TRUNCATE); n.dwInfoFlags = error ? NIIF_ERROR : NIIF_INFO;
@@ -451,17 +715,16 @@ public:
     }
     void activate() {
         if (active) { exitMode(); return; }
-        previousWindow = GetForegroundWindow(); auto started = Clock::now();
+        previousWindow = GetForegroundWindow();
         try {
             frame = capture();
-            canvas = std::make_unique<Bitmap>(frame->image->width, frame->image->height);
-            renderDc = CreateCompatibleDC(nullptr);
-            if (!renderDc) throw std::runtime_error("Cannot create overlay render device");
-            previousCanvas = SelectObject(renderDc, canvas->handle);
+            allocateCanvas();
         }
         catch (const std::exception& e) { frame.reset(); releaseCanvas(); notify(widen(e), true); return; }
-        words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear(); detectedLanguage.clear(); status = L"Recognizing screen text...";
-        active = true; recognizing = true; dragging = false; anchorWord = -1;
+        words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear(); detectedLanguage.clear();
+        status = L"Drag a box over text. Release to recognize and select it.";
+        active = true; recognizing = false; dragging = false; boxMode = true; anchorWord = -1; elapsed = 0;
+        selectionBox = {};
         session = ++worker->generation;
         POINT cursor{}; GetCursorPos(&cursor);
         HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST); MONITORINFO mi{sizeof(mi)}; GetMonitorInfo(monitor, &mi);
@@ -471,9 +734,7 @@ public:
         hud = {work.left + (work.right - work.left - width) / 2, work.top + ui(18), work.left + (work.right - work.left + width) / 2, work.top + ui(104)};
         copyButton = {hud.right - ui(142), hud.top + ui(12), hud.right - ui(48), hud.top + ui(44)};
         closeButton = {hud.right - ui(40), hud.top + ui(12), hud.right - ui(10), hud.top + ui(44)};
-        // Capture is complete: OCR can prepare its bitmap while the UI paints the
-        // initial overlay, rather than waiting for the entire first paint.
-        worker->submit({session, frame, settings.language, started});
+        // Activation only freezes the desktop. Recognition starts on box release.
         SetWindowLongPtr(window, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_APPWINDOW);
         SetWindowPos(window, HWND_TOPMOST, frame->desktop.left, frame->desktop.top, frame->image->width, frame->image->height, SWP_SHOWWINDOW);
         SetForegroundWindow(window); SetFocus(window); invalidate(); UpdateWindow(window);
@@ -481,9 +742,11 @@ public:
     void exitMode() {
         if (!active) return;
         bool restoreFocus = GetForegroundWindow() == window;
-        worker->cancel(); active = false; dragging = false; ReleaseCapture(); ShowWindow(window, SW_HIDE);
+        worker->cancel(); active = false; recognizing = false; dragging = false; ReleaseCapture(); ShowWindow(window, SW_HIDE);
         SetWindowLongPtr(window, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
-        words.clear(); words.shrink_to_fit(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear(); fonts.clear(); textMetrics.clear(); frame.reset(); releaseCanvas();
+        std::vector<Word>().swap(words); std::vector<WordRow>().swap(wordRows);
+        std::vector<Span>().swap(selection); std::vector<Span>().swap(baseSelection); std::vector<Span>().swap(nextSelection);
+        fonts.clear(); textMetrics.clear(); frame.reset(); releaseCanvas();
         if (restoreFocus && IsWindow(previousWindow)) SetForegroundWindow(previousWindow);
     }
     void measure(Word& word, HDC dc) {
@@ -503,8 +766,24 @@ public:
     }
     void accept(Result& r) {
         if (!active || r.id != session) return;
-        // Each batch owns only its new monitor's words. Existing character
-        // geometry and selections remain valid without copying or measuring again.
+        bool foundText = !r.words.empty();
+        // Ctrl-drag can overlap a previous box. Select existing words again rather
+        // than duplicating their text in the clipboard or remeasuring them.
+        if (!words.empty()) {
+            OcrPositionIndex existing;
+            for (size_t i = 0; i < words.size(); ++i) existing.add(words[i].rect,i);
+            r.words.erase(std::remove_if(r.words.begin(), r.words.end(), [&](const Word& incoming) {
+                size_t first = words.size();
+                existing.any(incoming.rect,[&](size_t i) {
+                    if (words[i].monitor == incoming.monitor && sameOcrPosition(words[i].rect,incoming.rect)) first = std::min(first,i);
+                    return false;
+                });
+                if (first == words.size()) return false;
+                selection[first] = {0,length(words[first])}; return true;
+            }), r.words.end());
+        }
+        int lineOffset = words.empty() ? 0 : words.back().line + 1;
+        for (auto& word : r.words) word.line += lineOffset;
         HDC dc = GetDC(window);
         size_t existing = words.size();
         words.insert(words.end(), std::make_move_iterator(r.words.begin()), std::make_move_iterator(r.words.end()));
@@ -536,10 +815,15 @@ public:
             wordRows.push_back({first, end, bounds}); first = end;
         }
         selection.resize(words.size()); baseSelection.resize(words.size());
+        for (size_t i = existing; i < words.size(); ++i) selection[i] = {0, length(words[i])};
+        baseSelection = selection;
         elapsed = r.elapsed; detectedLanguage = r.language; recognizing = !r.complete;
         if (!r.error.empty()) status = L"OCR failed: " + r.error;
-        else if (r.complete && words.empty()) status = L"No text found. Try another screen or OCR language.";
-        else status = std::to_wstring(words.size()) + L" words  |  " + detectedLanguage + L"  |  " + std::to_wstring(elapsed) + L" ms" + (recognizing ? L"  |  Recognizing remaining screens..." : L"");
+        else if (r.complete && !foundText) status = L"No text found in this box. Draw another box or try another OCR language.";
+        else {
+            auto selected = std::count_if(selection.begin(), selection.end(), [](Span s) { return s.begin < s.end; });
+            status = std::to_wstring(selected) + L" words selected  |  " + detectedLanguage + L"  |  " + std::to_wstring(elapsed) + L" ms  |  Ctrl+C to copy";
+        }
         invalidate();
     }
     std::pair<int, int> hit(POINT p, bool nearest) const {
@@ -563,35 +847,60 @@ public:
         if (c > 0 && c < length(w) && low(w.text[c]) && high(w.text[c - 1])) ++c;
         return {best, c};
     }
+    void cancelRecognition() {
+        worker->cancel(); session = worker->generation; recognizing = false;
+    }
+    void beginRegion(POINT p, bool add) {
+        if (!active || !frame) return;
+        cancelRecognition();
+        boxMode = true; addRegion = add; dragOrigin = p; dragging = true;
+        selectionBox = dragRegion(p, p, frame->image->width, frame->image->height);
+        status = L"Release to recognize and select the text in this box.";
+        SetCapture(window); invalidate();
+    }
+    void beginTextSelection(POINT p, bool add) {
+        cancelRecognition();
+        if (!add) std::fill(selection.begin(), selection.end(), Span{});
+        baseSelection = selection; boxMode = false; dragOrigin = p;
+        auto [index, character] = hit(p, true);
+        if (index < 0) { invalidate(); return; }
+        anchorWord = index; anchorCharacter = character; dragging = true; SetCapture(window);
+        invalidate();
+    }
     void mouseDown(POINT p, bool doubleClick) {
+        if (!active || !frame) return;
         if (inside(closeButton, p)) { exitMode(); return; }
         if (inside(copyButton, p)) { copy(false); return; }
-        if (inside(hud, p) || words.empty()) return;
+        if (inside(hud, p)) return;
         bool add = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        if (!add) std::fill(selection.begin(), selection.end(), Span{});
-        baseSelection = selection; boxMode = (GetKeyState(VK_MENU) & 0x8000) != 0; dragOrigin = p;
-        auto [index, character] = hit(p, !doubleClick);
-        if (index < 0) { invalidate(); return; }
-        if (doubleClick) { selection[index] = {0, length(words[index])}; invalidate(); return; }
-        anchorWord = index; anchorCharacter = character; dragging = true; SetCapture(window);
-        selectionBox = {p.x, p.y, p.x, p.y}; invalidate();
+        if (doubleClick && !words.empty()) {
+            auto [index, character] = hit(p, false);
+            if (index >= 0) {
+                cancelRecognition();
+                if (!add) std::fill(selection.begin(), selection.end(), Span{});
+                selection[index] = {0, length(words[index])}; invalidate(); return;
+            }
+        }
+        if (!(GetKeyState(VK_MENU) & 0x8000) || words.empty()) { beginRegion(p, add); return; }
+        beginTextSelection(p, add);
     }
     void mouseMove(POINT p) {
         if (!dragging) return;
-        nextSelection = baseSelection; RECT oldBox = selectionBox;
         if (boxMode) {
-            selectionBox = {std::min(p.x, dragOrigin.x), std::min(p.y, dragOrigin.y), std::max(p.x, dragOrigin.x), std::max(p.y, dragOrigin.y)};
-            for (size_t i = 0; i < words.size(); ++i) if (intersects(selectionBox, words[i].rect)) nextSelection[i] = {0, length(words[i])};
-        } else {
-            auto [index, character] = hit(p, true); if (index < 0) return;
-            auto start = std::pair{anchorWord, anchorCharacter}, end = std::pair{index, character};
-            if (start > end) std::swap(start, end);
-            for (int i = start.first; i <= end.first; ++i) {
-                Span range{i == start.first ? start.second : 0, i == end.first ? end.second : length(words[i])};
-                if (range.begin >= range.end) continue;
-                if (nextSelection[i].begin < nextSelection[i].end) range = {std::min(nextSelection[i].begin, range.begin), std::max(nextSelection[i].end, range.end)};
-                nextSelection[i] = range;
-            }
+            RECT old = selectionBox;
+            selectionBox = dragRegion(dragOrigin, p, frame->image->width, frame->image->height);
+            if (EqualRect(&old,&selectionBox)) return;
+            invalidateOutline(old); invalidateOutline(selectionBox); return;
+        }
+        nextSelection = baseSelection;
+        auto [index, character] = hit(p, true); if (index < 0) return;
+        auto start = std::pair{anchorWord, anchorCharacter}, end = std::pair{index, character};
+        if (start > end) std::swap(start, end);
+        for (int i = start.first; i <= end.first; ++i) {
+            Span range{i == start.first ? start.second : 0, i == end.first ? end.second : length(words[i])};
+            if (range.begin >= range.end) continue;
+            if (nextSelection[i].begin < nextSelection[i].end) range = {std::min(nextSelection[i].begin, range.begin), std::max(nextSelection[i].end, range.end)};
+            nextSelection[i] = range;
         }
         RECT dirty{}; bool changed = false;
         auto include = [&](RECT r) { if (changed) UnionRect(&dirty, &dirty, &r); else { dirty = r; changed = true; } };
@@ -603,17 +912,25 @@ public:
             LONG gap = std::max(12L, (area.bottom - area.top) * 2);
             InflateRect(&area, gap + 2, 2); include(area);
         }
-        if (boxMode && !EqualRect(&oldBox, &selectionBox)) {
-            InflateRect(&oldBox, 2, 2); include(oldBox);
-            RECT newBox = selectionBox; InflateRect(&newBox, 2, 2); include(newBox);
-        }
         selection.swap(nextSelection);
         if (changed) invalidate(dirty);
     }
-    void finishDrag() {
+    void finishDrag(bool recognize = false) {
         if (!dragging) return;
         dragging = false;
-        if (boxMode) { RECT area = selectionBox; InflateRect(&area, 2, 2); invalidate(area); }
+        if (!boxMode) return;
+        if (!recognize || selectionBox.right - selectionBox.left < 3 || selectionBox.bottom - selectionBox.top < 3) {
+            status = words.empty() ? L"Drag a box over text. Release to recognize and select it." : L"Draw another box, or press Ctrl+C to copy the selected text.";
+            invalidate(); return;
+        }
+        if (!addRegion) {
+            words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear();
+            fonts.clear(); textMetrics.clear(); detectedLanguage.clear();
+        }
+        recognizing = true; elapsed = 0; status = L"Recognizing selected box...";
+        session = ++worker->generation;
+        worker->submit({session, frame, selectionBox, settings.language, Clock::now()});
+        invalidate();
     }
     std::wstring selectedText() const {
         std::wstring output; int lastLine = -1, lastMonitor = -1;
@@ -630,8 +947,9 @@ public:
         return output;
     }
     void copy(bool exitAfter) {
+        if (recognizing) { status = L"Recognizing selected box... Text will be selected automatically when ready."; invalidate(); return; }
         auto text = selectedText();
-        if (text.empty()) { status = L"Select text first. Drag, double-click a word, or press Ctrl+A."; invalidate(); return; }
+        if (text.empty()) { status = L"Drag a box over text and release to recognize and select it."; invalidate(); return; }
         size_t bytes = (text.size() + 1) * sizeof(wchar_t); HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
         if (!memory) { status = L"Could not allocate clipboard memory."; invalidate(); return; }
         auto pointer = GlobalLock(memory);
@@ -640,31 +958,52 @@ public:
         if (!OpenClipboard(window)) { GlobalFree(memory); status = L"Clipboard is busy. Press Ctrl+C again."; invalidate(); return; }
         bool ok = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, memory); CloseClipboard();
         if (!ok) { GlobalFree(memory); status = L"Windows could not write the clipboard."; invalidate(); return; }
-        status = L"Copied " + std::to_wstring(text.size()) + L" characters. Keep selecting, or press Esc to return.";
+        status = L"Copied " + std::to_wstring(text.size()) + L" characters. Draw another box, or press Esc to return.";
         if (exitAfter) exitMode(); else invalidate();
     }
-    static void fill(HDC dc, RECT r, COLORREF color) { HBRUSH b = CreateSolidBrush(color); FillRect(dc, &r, b); DeleteObject(b); }
+    static void fill(HDC dc, RECT r, COLORREF color) {
+        SetDCBrushColor(dc,color); FillRect(dc,&r,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    }
     void hudText(HDC dc, const std::wstring& value, RECT r, int size, COLORREF color, UINT flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS) {
         auto previous = SelectObject(dc, fonts.get(size)); SetTextColor(dc, color); SetBkMode(dc, TRANSPARENT);
         DrawText(dc, value.c_str(), static_cast<int>(value.size()), &r, flags | DT_NOPREFIX); SelectObject(dc, previous);
     }
     void paint() {
+        // Preserve complex update regions: using only rcPaint would repaint the
+        // whole box interior even when just its thin outline changed.
+        alignas(RGNDATA) std::array<BYTE,sizeof(RGNDATAHEADER) + 64 * sizeof(RECT)> storage{};
+        auto data = reinterpret_cast<RGNDATA*>(storage.data());
+        HRGN update = CreateRectRgn(0,0,0,0); DWORD bytes = 0;
+        if (update && GetUpdateRgn(window,update,FALSE) == COMPLEXREGION)
+            bytes = GetRegionData(update,static_cast<DWORD>(storage.size()),data);
+        if (update) DeleteObject(update);
         PAINTSTRUCT ps{}; HDC screen = BeginPaint(window, &ps);
         if (!active || !frame || !canvas) { EndPaint(window, &ps); return; }
-        render(screen, ps.rcPaint); EndPaint(window, &ps);
+        if (bytes && bytes <= storage.size() && data->rdh.nCount <= 64) {
+            auto rectangles = reinterpret_cast<const RECT*>(data->Buffer);
+            for (DWORD i = 0; i < data->rdh.nCount; ++i) render(screen,rectangles[i]);
+        } else render(screen,ps.rcPaint);
+        EndPaint(window, &ps);
     }
     void render(HDC screen, RECT damage) {
-        RECT bounds{0, 0, canvas->width, canvas->height};
+        RECT bounds{0,0,frame->image->width,frame->image->height};
         if (!IntersectRect(&damage, &damage, &bounds)) return;
+        for (LONG y = damage.top; y < damage.bottom; y += canvas->height)
+            for (LONG x = damage.left; x < damage.right; x += canvas->width)
+                renderTile(screen,{x,y,std::min(x + canvas->width,damage.right),std::min(y + canvas->height,damage.bottom)});
+    }
+    void renderTile(HDC screen, RECT damage) {
         HDC dc = renderDc;
+        POINT origin{damage.left,damage.top};
         // Finish previous GDI writes before accessing the DIB pixels directly.
-        GdiFlush(); blendRect(*canvas, *frame->image, damage, 0x00080e16, 33);
-        SelectClipRgn(dc, nullptr); IntersectClipRect(dc, damage.left, damage.top, damage.right, damage.bottom);
+        GdiFlush(); blendRect(*canvas, *frame->image, damage, 0x00080e16, 33,origin);
+        SelectClipRgn(dc,nullptr); SetViewportOrgEx(dc,-damage.left,-damage.top,nullptr);
+        IntersectClipRect(dc, damage.left, damage.top, damage.right, damage.bottom);
         // Tint the captured pixels instead of redrawing OCR text in a guessed font.
         // Merge selected neighboring words into continuous strips, including spaces.
         auto drawHighlight = [&](RECT strip) {
             RECT clipped{}; if (!IntersectRect(&clipped, &strip, &damage)) return;
-            blendRect(*canvas, *frame->image, clipped, 0x00258cde, 76);
+            blendRect(*canvas, *frame->image, clipped, 0x00258cde, 76,origin);
         };
         RECT strip{}; bool haveStrip = false; size_t previousIndex = 0;
         for (size_t i = 0; i < words.size(); ++i) {
@@ -681,7 +1020,8 @@ public:
             previousIndex = i;
         }
         if (haveStrip) drawHighlight(strip);
-        if (dragging && boxMode) {
+        if ((dragging && boxMode) || recognizing) {
+            SetBkMode(dc,TRANSPARENT);
             HPEN pen = CreatePen(PS_DOT, 1, RGB(84, 209, 255)); auto oldPen = SelectObject(dc, pen), oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
             Rectangle(dc, selectionBox.left, selectionBox.top, selectionBox.right, selectionBox.bottom);
             SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(pen);
@@ -689,11 +1029,11 @@ public:
         if (intersects(hud, damage)) {
         fill(dc, hud, RGB(17, 27, 40)); RECT stripe{hud.left, hud.top, hud.left + ui(4), hud.bottom}; fill(dc, stripe, RGB(66, 192, 245));
         RECT title{hud.left + ui(18), hud.top + ui(9), copyButton.left - ui(10), hud.top + ui(36)};
-        hudText(dc, recognizing ? L"Glyph  /  OCR MODE  /  Recognizing..." : L"Glyph  /  OCR MODE  /  Select text", title, ui(19), RGB(242, 247, 255));
+        hudText(dc, recognizing ? L"Glyph  /  OCR MODE  /  Recognizing box..." : L"Glyph  /  OCR MODE  /  Draw a box", title, ui(19), RGB(242, 247, 255));
         fill(dc, copyButton, RGB(34, 106, 151)); hudText(dc, L"Copy", copyButton, ui(15), RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         hudText(dc, L"\x00d7", closeButton, ui(24), RGB(226, 235, 244), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         RECT help{hud.left + ui(18), hud.top + ui(38), hud.right - ui(14), hud.top + ui(59)};
-        hudText(dc, L"Drag: text   Alt-drag: box   Ctrl-drag: add   Ctrl+A: all   Ctrl+C: copy   Enter: copy & exit   Esc: exit", help, ui(13), RGB(166, 188, 210));
+        hudText(dc, L"Drag: OCR box   Ctrl-drag: add box   Alt-drag: text   Ctrl+C: copy   Enter: copy & exit   Esc: exit", help, ui(13), RGB(166, 188, 210));
         RECT detail{hud.left + ui(18), hud.top + ui(60), hud.right - ui(14), hud.bottom - ui(5)};
         hudText(dc, status, detail, ui(13), RGB(107, 207, 237));
         }
@@ -747,7 +1087,7 @@ public:
         case 11: ShellExecute(window, L"open", L"notepad.exe", (L"\"" + config.wstring() + L"\"").c_str(), nullptr, SW_SHOWNORMAL); break;
         case 12: loadSettings(); break;
         case 13: toggleStartup(); break;
-        case 14: MessageBox(window, (L"Press " + settings.hotkey + L" to freeze the screen and recognize text locally.\n\nDrag to select characters. Double-click selects a word.\nAlt-drag selects a box. Ctrl-drag adds another range.\nCtrl+A selects all. Ctrl+C copies. Enter copies and exits.\nEsc returns to the desktop.\n\nChange the shortcut or OCR language through Settings, then Reload settings.\nWindows OCR language features must be installed.\nScreenshots are kept in memory only during OCR mode.\n\nIf Windows blocks OCR, use the MSIX installation included with this app.").c_str(), APP_NAME, MB_OK | MB_ICONINFORMATION); break;
+        case 14: MessageBox(window, (L"Press " + settings.hotkey + L" to freeze the screen. No OCR runs until you draw a box.\n\nDrag a box over text and release. Only that box is recognized, and its text is selected automatically.\nCtrl-drag adds another box. Alt-drag adjusts the character selection in recognized text. Double-click selects a recognized word.\nCtrl+A selects all recognized text. Ctrl+C copies. Enter copies and exits.\nEsc returns to the desktop.\n\nChange the shortcut or OCR language through Settings, then Reload settings.\nWindows OCR language features must be installed.\nScreenshots are kept in memory only during OCR mode.\n\nIf Windows blocks OCR, use the MSIX installation included with this app.").c_str(), APP_NAME, MB_OK | MB_ICONINFORMATION); break;
         case 15: shutdown(); break;
         default:
             if (command >= 100 && command <= 100 + languages.size()) {
@@ -785,8 +1125,16 @@ public:
         case WM_LBUTTONDOWN: mouseDown({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, false); return 0;
         case WM_LBUTTONDBLCLK: mouseDown({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, true); return 0;
         case WM_MOUSEMOVE: mouseMove({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}); return 0;
-        case WM_LBUTTONUP: if (dragging) mouseMove({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}); finishDrag(); ReleaseCapture(); return 0;
+        case WM_LBUTTONUP: if (dragging) mouseMove({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}); finishDrag(true); ReleaseCapture(); return 0;
         case WM_CAPTURECHANGED: finishDrag(); return 0;
+        case WM_CANCELMODE: finishDrag(); ReleaseCapture(); return 0;
+        case WM_SETCURSOR:
+            if (active && LOWORD(lp) == HTCLIENT) {
+                POINT p{}; GetCursorPos(&p); ScreenToClient(window, &p);
+                SetCursor(LoadCursor(nullptr, inside(hud, p) ? IDC_ARROW : (!words.empty() && (GetKeyState(VK_MENU) & 0x8000) ? IDC_IBEAM : IDC_CROSS)));
+                return TRUE;
+            }
+            break;
         case WM_SYSKEYDOWN:
         case WM_KEYDOWN:
             if (!active) break;
@@ -834,7 +1182,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     try {
         App app;
         WNDCLASSEX cls{sizeof(cls)}; cls.style = CS_DBLCLKS; cls.lpfnWndProc = windowProc; cls.hInstance = instance;
-        cls.hIcon = LoadIcon(instance, MAKEINTRESOURCE(1)); cls.hCursor = LoadCursor(nullptr, IDC_IBEAM); cls.lpszClassName = L"GlyphOverlay";
+        cls.hIcon = LoadIcon(instance, MAKEINTRESOURCE(1)); cls.hCursor = LoadCursor(nullptr, IDC_CROSS); cls.lpszClassName = L"GlyphOverlay";
         if (!RegisterClassEx(&cls)) throw std::runtime_error("Cannot register overlay window");
         HWND window = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, cls.lpszClassName, APP_NAME, WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, &app);
         if (!window) throw std::runtime_error("Cannot create overlay window");

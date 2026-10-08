@@ -6,7 +6,7 @@
 
 **Text within reach.** Select and copy text from anywhere on your Windows desktop—even when the app, image, video, or webpage doesn't let you select it.
 
-Press **Ctrl+Alt+T**, select the text, and copy. Press **Esc** to return to your desktop.
+Press **Ctrl+Alt+T**, drag a box over the text, and release. Glyph recognizes only that box and selects its text automatically. Copy it, or press **Esc** to return to your desktop.
 
 Glyph is a small native C++20 tray app powered by Windows' offline OCR. It has no bundled OCR models, third-party runtime, network requests, or background screen recording.
 
@@ -14,7 +14,8 @@ Glyph is a small native C++20 tray app powered by Windows' offline OCR. It has n
 
 ## Features
 
-- Select individual characters, words, multiple lines, or a rectangular region.
+- Draw a box to recognize and automatically select its text; activation does not start OCR.
+- Refine recognized text by selecting individual characters, words, or multiple lines.
 - Add separate selections and copy them together.
 - Preserve the screen's original fonts and text, with connected translucent selection highlights.
 - Capture multiple monitors, including mixed DPI and negative monitor coordinates.
@@ -28,8 +29,9 @@ Glyph is a small native C++20 tray app powered by Windows' offline OCR. It has n
 
 1. Download the Windows x64 ZIP from [Releases](https://github.com/Prit36/Glyph/releases/latest) and extract it.
 2. Run `Glyph.exe`. Glyph appears in your notification area.
-3. Press **Ctrl+Alt+T**. The desktop freezes while OCR runs; text becomes selectable as recognition completes for each monitor.
-4. Drag to select text. Press **Ctrl+C** to copy, or **Enter** to copy and exit.
+3. Press **Ctrl+Alt+T**. The desktop freezes and the selection overlay appears. OCR waits for you to choose a region.
+4. Drag a box over the text and release. OCR runs only inside the box; all returned text is highlighted automatically when recognition finishes.
+5. Press **Ctrl+C** to copy, or **Enter** to copy and exit. Draw a new box to replace the result, or **Ctrl-drag** to add another box.
 
 The portable executable does not require an administrator account. Windows officially supports this OCR API in desktop apps with package identity; unpackaged OCR works on some systems but is not guaranteed. If OCR is unavailable, use the packaged installation below.
 
@@ -57,11 +59,11 @@ Quit Glyph before uninstalling. Use Windows Settings or `uninstall.ps1`. Optiona
 
 | Action | Control |
 |---|---|
-| Select characters across words and lines | Drag |
-| Select a word | Double-click |
-| Select words in a rectangle | Alt-drag |
-| Add a separate selection | Ctrl-drag |
-| Add a rectangular selection | Ctrl+Alt-drag |
+| Recognize a box and automatically select its text | Drag, then release |
+| Add text from another box | Ctrl-drag, then release |
+| Refine a character selection across recognized words and lines | Alt-drag |
+| Add a character range in recognized text | Ctrl+Alt-drag |
+| Select a recognized word | Double-click |
 | Select all recognized text | Ctrl+A |
 | Copy and keep OCR mode open | Ctrl+C or Copy button |
 | Copy and exit | Enter |
@@ -87,16 +89,18 @@ Shortcuts accept Ctrl, Alt, Shift, Win, letters, digits, Space, and F1–F24. Us
 
 OCR runs locally. Screenshots and recognized text stay in process memory and are released when OCR mode ends. Copying uses the Windows clipboard; your Windows clipboard history and cloud-sync settings still apply.
 
-The tray app blocks on Windows messages, and its worker sleeps while idle. The OCR engine is initialized once at startup. Each activation captures and recognizes the current screen afresh; there is no OCR result cache.
+The tray app blocks on Windows messages, and its worker sleeps while idle. The OCR engine is initialized once at startup. Each activation captures a fresh frozen desktop but does not recognize it. Releasing a box submits only that region to the worker, including only its intersections with physical monitors. Starting another drag cancels an unfinished request; stale results are discarded. There is no OCR result cache.
 
-Recognition runs on a worker thread at native screen resolution. Large screens are processed in overlapping strips using grayscale OCR input. Selection repaints only changed areas, and fonts and text measurements are reused within the active session. Latency depends on screen size, text density, installed language, and Windows OCR.
+Recognition runs on a worker thread using grayscale OCR input. Native-resolution and 2× passes are followed by smaller 3×/4× recovery crops with contrast stretching and automatic dark-background inversion. A final thresholded 4× pass only fills remaining gaps. All passes use overlapping tiles within Windows' image-size limit and a 5-megapixel input budget per tile; uniform tiles are skipped. Readings that agree across different scales take priority, with native text favored on ties for normal-size words and stronger enlargement favored for tiny words. Threshold recovery cannot overwrite other readings. Word boxes are scaled and rotated back to the original screen for merging and selection.
 
-The v1.2.4 executable is approximately **286 KiB**, with a statically linked C++ runtime. Runtime memory depends on display resolution: the screenshot and rendering buffer alone use about **63 MiB for one 4K desktop**, plus OCR and other app allocations.
+The recovery passes increase recognition latency. Timing depends on the selected box's size, text density, installed language, and Windows OCR. Small regions reuse a job-local grayscale buffer capped at 1 MiB. Candidate matching uses a spatial index on both axes. Box dragging repaints the changed outlines, preserving complex update regions; fonts and text measurements are reused within the active session.
+
+The executable uses a statically linked C++ runtime. Runtime memory depends on display resolution: the screenshot and bounded rendering buffer alone use about **35.4 MiB for one 4K desktop**. The scratch rendering buffer is capped at 4 MiB, and large selection containers are released on exit. OCR and other app allocations are additional.
 
 ## Limitations
 
 - OCR can misread small, stylized, rotated, or low-contrast text. Character boundaries are estimated from word boxes and font measurements.
-- Ordinary selection follows visual rows, top to bottom and left to right within each monitor. Use rectangular selection for columns or separate layout regions.
+- Text within each box follows visual rows, top to bottom and left to right within each monitor. Draw separate boxes for columns or independent layout regions.
 - Protected video, secure desktops, and some exclusive fullscreen applications cannot be captured normally.
 - Recognition already in progress may finish after Esc; stale results are discarded. Changing the monitor layout exits OCR mode.
 
