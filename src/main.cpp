@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -352,12 +353,14 @@ SoftwareBitmap tileBitmap(const Frame& frame, int x, int y, int w, int h, int sc
         int first = position / denominator;
         columns[col] = {first, std::min(first + 1, w - 1), position % denominator};
     }
-    std::vector<int> topRow(columns.size()), bottomRow(columns.size());
-    auto horizontal = [&](int row, std::vector<int>& values) {
+    // At scales 1–4, horizontal sums fit in 11 bits, and rounded vertical
+    // sums fit in 14 bits. Keep rows compact and blend eight samples at once.
+    std::vector<uint16_t> topRow(columns.size()), bottomRow(columns.size());
+    auto horizontal = [&](int row, std::vector<uint16_t>& values) {
         const auto source = input + inputPlane.StartIndex + static_cast<size_t>(row) * inputPlane.Stride;
         for (size_t col = 0; col < columns.size(); ++col) {
             const auto& c = columns[col];
-            values[col] = tone[source[c.first]] * (denominator - c.weight) + tone[source[c.second]] * c.weight;
+            values[col] = static_cast<uint16_t>(tone[source[c.first]] * (denominator - c.weight) + tone[source[c.second]] * c.weight);
         }
     };
     int cachedTop = -1, cachedBottom = -1;
@@ -372,7 +375,24 @@ SoftwareBitmap tileBitmap(const Frame& frame, int x, int y, int w, int h, int sc
         }
         if (y1 != cachedBottom) { horizontal(y1, bottomRow); cachedBottom = y1; }
         auto write = [&]<int Divisor>() {
-            for (size_t col = 0; col < columns.size(); ++col)
+            size_t col = 0;
+            if constexpr (Divisor == 16 || Divisor == 36 || Divisor == 64) {
+                auto topWeight = _mm_set1_epi16(static_cast<short>(denominator - fy));
+                auto bottomWeight = _mm_set1_epi16(static_cast<short>(fy));
+                auto rounding = _mm_set1_epi16(Divisor / 2);
+                for (; col + 8 <= columns.size(); col += 8) {
+                    auto a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(topRow.data() + col));
+                    auto b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bottomRow.data() + col));
+                    auto sum = _mm_add_epi16(_mm_add_epi16(_mm_mullo_epi16(a, topWeight), _mm_mullo_epi16(b, bottomWeight)), rounding);
+                    __m128i value;
+                    if constexpr (Divisor == 36) {
+                        // Exact unsigned 16-bit division: ceil(2^21 / 36).
+                        value = _mm_srli_epi16(_mm_mulhi_epu16(sum, _mm_set1_epi16(static_cast<short>(58255))), 5);
+                    } else value = _mm_srli_epi16(sum, Divisor == 16 ? 4 : 6);
+                    _mm_storel_epi64(reinterpret_cast<__m128i*>(output + col), _mm_packus_epi16(value, value));
+                }
+            }
+            for (; col < columns.size(); ++col)
                 output[col] = static_cast<uint8_t>((topRow[col] * (denominator - fy) + bottomRow[col] * fy + Divisor / 2) / Divisor);
         };
         if (scale == 2) write.template operator()<16>();
@@ -437,21 +457,26 @@ public:
 };
 
 std::vector<Word> mergeOcrCandidates(std::vector<OcrCandidate> candidates) {
-    OcrPositionIndex evidence;
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        auto& candidate = candidates[i]; const auto& r = candidate.word.rect;
-        candidate.votes = 1u << candidate.scale;
-        evidence.add(r,i);
-    }
-    for (auto& candidate : candidates) {
-        const auto& r = candidate.word.rect;
-        evidence.any(r,[&](size_t index) {
-            const auto& other = candidates[index];
-            if (!other.gapOnly && candidate.scale != other.scale && sameOcrPosition(r, other.word.rect) &&
-                CompareStringOrdinal(candidate.word.text.c_str(), -1, other.word.text.c_str(), -1, TRUE) == CSTR_EQUAL)
-                candidate.votes |= 1u << other.scale;
-            return false;
-        });
+    // Release the evidence index before sorting and building the accepted index.
+    {
+        OcrPositionIndex evidence;
+        unsigned availableVotes = 0;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            auto& candidate = candidates[i]; const auto& r = candidate.word.rect;
+            candidate.votes = 1u << candidate.scale;
+            availableVotes |= candidate.votes;
+            evidence.add(r,i);
+        }
+        for (auto& candidate : candidates) {
+            const auto& r = candidate.word.rect;
+            evidence.any(r,[&](size_t index) {
+                const auto& other = candidates[index];
+                if (!other.gapOnly && !(candidate.votes & (1u << other.scale)) && sameOcrPosition(r, other.word.rect) &&
+                    CompareStringOrdinal(candidate.word.text.c_str(), -1, other.word.text.c_str(), -1, TRUE) == CSTR_EQUAL)
+                    candidate.votes |= 1u << other.scale;
+                return candidate.votes == availableVotes;
+            });
+        }
     }
     // Prefer complete readings confirmed at different scales. Duplicate tiles
     // at the same scale are one vote, not extra evidence. Preserve native results
@@ -517,7 +542,7 @@ class EnginePool {
     std::mutex mtx;
     std::vector<OcrEngine> pool;
 public:
-    explicit EnginePool(std::wstring lang = L"auto") : language(std::move(lang)) {}
+    explicit EnginePool(std::wstring lang = L"auto") : language(std::move(lang)) { pool.reserve(4); }
     void setLanguage(const std::wstring& lang) {
         std::lock_guard lock(mtx);
         if (language != lang) {
@@ -526,17 +551,25 @@ public:
         }
     }
     OcrEngine acquire() {
-        std::lock_guard lock(mtx);
-        if (!pool.empty()) {
-            auto e = pool.back();
-            pool.pop_back();
-            return e;
+        std::wstring currentLanguage;
+        {
+            std::lock_guard lock(mtx);
+            if (!pool.empty()) {
+                auto e = std::move(pool.back());
+                pool.pop_back();
+                return e;
+            }
+            currentLanguage = language;
         }
-        return createEngine(language);
+        // Initialization can be slow; independent engines need not serialize.
+        // Language changes happen only between fully drained region jobs.
+        return createEngine(currentLanguage);
     }
-    void release(OcrEngine e) {
-        std::lock_guard lock(mtx);
-        pool.push_back(std::move(e));
+    void release(OcrEngine e) noexcept {
+        try {
+            std::lock_guard lock(mtx);
+            if (pool.size() < 4) pool.push_back(std::move(e));
+        } catch (...) {} // Recycling failure must not interrupt task completion.
     }
     void clear() {
         std::lock_guard lock(mtx);
@@ -546,43 +579,99 @@ public:
 
 class ThreadPool {
     std::vector<std::thread> workers;
-    std::queue<std::function<void()>> tasks;
+    std::queue<std::function<void(std::exception_ptr)>> tasks;
     std::mutex queueMutex;
     std::condition_variable cv;
     bool stop = false;
 public:
     explicit ThreadPool(size_t threads) {
-        for (size_t i = 0; i < threads; ++i) {
-            workers.emplace_back([this]() {
-                try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
-                while (true) {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock lock(queueMutex);
-                        cv.wait(lock, [this]() { return stop || !tasks.empty(); });
-                        if (stop && tasks.empty()) return;
-                        task = std::move(tasks.front());
-                        tasks.pop();
+        workers.reserve(threads);
+        try {
+            for (size_t i = 0; i < threads; ++i) {
+                workers.emplace_back([this]() {
+                    std::exception_ptr apartmentError;
+                    try { winrt::init_apartment(winrt::apartment_type::multi_threaded); }
+                    catch (...) { apartmentError = std::current_exception(); }
+                    while (true) {
+                        std::function<void(std::exception_ptr)> task;
+                        {
+                            std::unique_lock lock(queueMutex);
+                            cv.wait(lock, [this]() { return stop || !tasks.empty(); });
+                            if (stop && tasks.empty()) break;
+                            task = std::move(tasks.front());
+                            tasks.pop();
+                        }
+                        // parallelFor records initialization and task failures on
+                        // the submitting thread, after all references are drained.
+                        task(apartmentError);
                     }
-                    task();
-                }
-            });
-        }
+                    if (!apartmentError) winrt::uninit_apartment();
+                });
+            }
+        } catch (...) { shutdown(); throw; }
     }
-    void enqueue(std::function<void()> task) {
+private:
+    void enqueue(std::function<void(std::exception_ptr)> task) {
         {
             std::unique_lock lock(queueMutex);
             tasks.push(std::move(task));
         }
         cv.notify_one();
     }
-    template<typename Cancelled>
-    void waitAll(size_t expectedTasks, std::atomic<size_t>& completed, Cancelled cancelled) {
-        while (completed.load() < expectedTasks && !cancelled()) {
-            std::this_thread::yield();
+public:
+    template<typename Function>
+    void parallelFor(size_t count, Function function) {
+        if (!count) return;
+        struct Group {
+            std::mutex mutex;
+            std::condition_variable done;
+            std::atomic<size_t> next{0};
+            size_t remaining{};
+            std::exception_ptr error;
+        } group;
+        // Queue only one runner per worker, regardless of desktop/tile count.
+        // Each runner takes the next tile dynamically to balance uneven OCR time.
+        try {
+            for (size_t runner = 0; runner < std::min(count, workers.size()); ++runner) {
+                { std::lock_guard lock(group.mutex); ++group.remaining; }
+                try {
+                    enqueue([&](std::exception_ptr apartmentError) {
+                        try {
+                            if (apartmentError) std::rethrow_exception(apartmentError);
+                            for (;;) {
+                                size_t i = group.next.fetch_add(1, std::memory_order_relaxed);
+                                if (i >= count) break;
+                                if (!function(i)) { group.next.store(count, std::memory_order_relaxed); break; }
+                            }
+                        } catch (...) {
+                            group.next.store(count, std::memory_order_relaxed);
+                            std::lock_guard lock(group.mutex);
+                            if (!group.error) group.error = std::current_exception();
+                        }
+                        // Notify while holding the lock: the submitting thread
+                        // must not destroy the group until this last access ends.
+                        std::lock_guard lock(group.mutex);
+                        --group.remaining; group.done.notify_one();
+                    });
+                } catch (...) {
+                    std::lock_guard lock(group.mutex); --group.remaining;
+                    throw;
+                }
+            }
+        } catch (...) {
+            group.next.store(count, std::memory_order_relaxed);
+            std::lock_guard lock(group.mutex);
+            if (!group.error) group.error = std::current_exception();
         }
+        // Cancellation stops new OCR work, but running calls still own frame,
+        // grayscale, result and callback references. Always wait for those calls.
+        std::unique_lock lock(group.mutex);
+        group.done.wait(lock, [&] { return group.remaining == 0; });
+        if (group.error) std::rethrow_exception(group.error);
     }
-    ~ThreadPool() {
+    ~ThreadPool() { shutdown(); }
+private:
+    void shutdown() {
         {
             std::unique_lock lock(queueMutex);
             stop = true;
@@ -596,9 +685,6 @@ public:
 
 template<typename Cancelled>
 std::vector<Word> recognizeRegion(const Frame& frame, RECT region, int monitor, EnginePool& engines, ThreadPool& pool, int limit, Cancelled cancelled) {
-    auto grayscale = GrayImage::create(frame, region, cancelled);
-    if (cancelled()) return {};
-
     struct TaskInfo {
         RECT tile;
         int scale;
@@ -608,9 +694,8 @@ std::vector<Word> recognizeRegion(const Frame& frame, RECT region, int monitor, 
     };
     std::vector<TaskInfo> tasks;
 
-    for (int pass : {1, 2, 3, 4, 5}) {
+    for (int scale : {1, 2, 3, 4}) {
         if (cancelled()) return {};
-        int scale = std::min(pass, 4);
         for (auto tile : ocrTiles(region.right - region.left, region.bottom - region.top, limit, scale)) {
             if (cancelled()) return {};
             OffsetRect(&tile, region.left, region.top);
@@ -623,65 +708,96 @@ std::vector<Word> recognizeRegion(const Frame& frame, RECT region, int monitor, 
             }
             if (!detail) continue;
 
-            tasks.push_back({tile, scale, scale >= 3, pass == 5, pass == 5});
+            tasks.push_back({tile, scale, scale >= 3, false, false});
         }
+    }
+    // Threshold recovery uses the very same 4x crops. Reuse the detail test
+    // instead of scanning these screenshot pixels a second time.
+    size_t primaryTasks = tasks.size();
+    for (size_t i = 0; i < primaryTasks; ++i) {
+        if (tasks[i].scale != 4) continue;
+        auto task = tasks[i]; task.binary = true; task.gapOnly = true;
+        tasks.push_back(task);
     }
 
     if (tasks.empty() || cancelled()) return {};
-
-    std::vector<std::vector<OcrCandidate>> results(tasks.size());
-    std::atomic<size_t> completedCount{0};
-
-    for (size_t i = 0; i < tasks.size(); ++i) {
-        pool.enqueue([&, i]() {
-            if (cancelled()) {
-                ++completedCount;
-                return;
-            }
-            auto engine = engines.acquire();
-            const auto& t = tasks[i];
-            auto bitmap = tileBitmap(frame, t.tile.left, t.tile.top,
-                                     t.tile.right - t.tile.left, t.tile.bottom - t.tile.top,
-                                     t.scale, t.enhance, t.binary, grayscale.get());
-            try {
-                if (!cancelled()) {
-                    auto recognized = engine.RecognizeAsync(bitmap).get();
-                    auto angle = recognized.TextAngle(); double degrees = angle ? angle.Value() : 0;
-                    for (auto line : recognized.Lines()) {
-                        for (auto item : line.Words()) {
-                            auto candidate = ocrCandidate(item.Text().c_str(), item.BoundingRect(), t.tile, t.scale, monitor, degrees);
-                            candidate.gapOnly = t.gapOnly;
-                            const auto& w = candidate.word;
-                            if (!w.text.empty() && w.rect.right > w.rect.left && w.rect.bottom > w.rect.top) {
-                                results[i].push_back(std::move(candidate));
-                            }
-                        }
-                    }
-                }
-            } catch (...) {}
-            engines.release(std::move(engine));
-            ++completedCount;
-        });
-    }
-
-    pool.waitAll(tasks.size(), completedCount, cancelled);
-
+    auto grayscale = GrayImage::create(frame, region, cancelled);
     if (cancelled()) return {};
 
+    std::vector<std::vector<OcrCandidate>> results(tasks.size());
+    pool.parallelFor(tasks.size(), [&](size_t i) {
+        if (cancelled()) return false;
+        auto engine = engines.acquire();
+        // Return engines on allocation, preprocessing and recognition errors.
+        struct Recycle {
+            EnginePool& pool;
+            OcrEngine& engine;
+            ~Recycle() { pool.release(std::move(engine)); }
+        } recycle{engines, engine};
+        const auto& t = tasks[i];
+        auto bitmap = tileBitmap(frame, t.tile.left, t.tile.top,
+                                 t.tile.right - t.tile.left, t.tile.bottom - t.tile.top,
+                                 t.scale, t.enhance, t.binary, grayscale.get());
+        if (!cancelled()) {
+            auto recognized = engine.RecognizeAsync(bitmap).get();
+            auto angle = recognized.TextAngle(); double degrees = angle ? angle.Value() : 0;
+            for (auto line : recognized.Lines()) {
+                for (auto item : line.Words()) {
+                    auto candidate = ocrCandidate(item.Text().c_str(), item.BoundingRect(), t.tile, t.scale, monitor, degrees);
+                    candidate.gapOnly = t.gapOnly;
+                    const auto& w = candidate.word;
+                    if (!w.text.empty() && w.rect.right > w.rect.left && w.rect.bottom > w.rect.top) {
+                        results[i].push_back(std::move(candidate));
+                    }
+                }
+            }
+        }
+        return !cancelled();
+    });
+
+    if (cancelled()) return {};
+    // No task can access these now. Free them before allocating combined results.
+    grayscale.reset();
+    std::vector<TaskInfo>().swap(tasks);
+
     std::vector<OcrCandidate> allCandidates;
+    size_t total = 0;
+    for (const auto& r : results) total += r.size();
+    allCandidates.reserve(total);
     for (auto& r : results) {
         allCandidates.insert(allCandidates.end(), std::make_move_iterator(r.begin()), std::make_move_iterator(r.end()));
+        std::vector<OcrCandidate>().swap(r);
     }
+    std::vector<std::vector<OcrCandidate>>().swap(results);
 
     return mergeOcrCandidates(std::move(allCandidates));
 }
 
-template<typename Cancelled>
-std::vector<Word> recognizeRegion(const Frame& frame, RECT region, int monitor, const OcrEngine& engine, int limit, Cancelled cancelled) {
-    EnginePool engines;
-    engines.setLanguage(engine.RecognizerLanguage().LanguageTag().c_str());
-    ThreadPool pool(std::clamp<size_t>(std::thread::hardware_concurrency() > 2 ? std::thread::hardware_concurrency() / 2 : 2, 2, 4));
-    return recognizeRegion(frame, region, monitor, engines, pool, limit, cancelled);
+void appendVisualRows(std::vector<Word>& words, std::vector<Word>& output, int& nextLine) {
+    // Keep only indexes while grouping: the source already owns the words.
+    // Preserve stable row/word ordering, including ties and tile-seam fragments.
+    std::stable_sort(words.begin(), words.end(), [](const Word& a, const Word& b) { return a.rect.top < b.rect.top; });
+    LONG tallest = 0;
+    for (const auto& word : words) tallest = std::max(tallest, word.rect.bottom - word.rect.top);
+    std::vector<std::vector<size_t>> rows;
+    for (size_t i = 0; i < words.size(); ++i) {
+        const auto& w = words[i];
+        auto row = rows.rbegin();
+        for (; row != rows.rend(); ++row) {
+            const auto& anchor = words[row->front()].rect;
+            if (w.rect.top - anchor.top > tallest) { row = rows.rend(); break; }
+            double centerA = (anchor.top + anchor.bottom) / 2.0, centerB = (w.rect.top + w.rect.bottom) / 2.0;
+            if (std::abs(centerA - centerB) <= std::max(3.0, std::min(anchor.bottom - anchor.top, w.rect.bottom - w.rect.top) * .45)) break;
+        }
+        if (row == rows.rend()) { rows.emplace_back(); rows.back().push_back(i); }
+        else row->push_back(i);
+    }
+    output.reserve(output.size() + words.size());
+    for (auto& row : rows) {
+        std::stable_sort(row.begin(), row.end(), [&](size_t a, size_t b) { return words[a].rect.left < words[b].rect.left; });
+        int line = nextLine++;
+        for (size_t i : row) { words[i].line = line; output.push_back(std::move(words[i])); }
+    }
 }
 
 // Native x64 includes SSE2. Blend four BGRA pixels per iteration directly into
@@ -781,27 +897,7 @@ private:
                     auto words = recognizeRegion(*job.frame, region, monitorIndex, engines, pool, limit, [&] { return generation != job.id; });
                     if (generation != job.id) break;
                     // Group fragments from tile seams into visual rows, then order words within each row.
-                    std::stable_sort(words.begin(), words.end(), [](const Word& a, const Word& b) { return a.rect.top < b.rect.top; });
-                    LONG tallest = 0;
-                    for (const auto& word : words) tallest = std::max(tallest, word.rect.bottom - word.rect.top);
-                    std::vector<std::vector<Word>> rows;
-                    for (auto& w : words) {
-                        auto row = rows.rbegin();
-                        for (; row != rows.rend(); ++row) {
-                            const auto& anchor = row->front().rect;
-                            if (w.rect.top - anchor.top > tallest) { row = rows.rend(); break; }
-                            double centerA = (anchor.top + anchor.bottom) / 2.0, centerB = (w.rect.top + w.rect.bottom) / 2.0;
-                            if (std::abs(centerA - centerB) <= std::max(3.0, std::min(anchor.bottom - anchor.top, w.rect.bottom - w.rect.top) * .45)) break;
-                        }
-                        if (row == rows.rend()) { rows.emplace_back(); rows.back().push_back(std::move(w)); }
-                        else row->push_back(std::move(w));
-                    }
-                    result->words.reserve(result->words.size() + words.size());
-                    for (auto& row : rows) {
-                        std::stable_sort(row.begin(), row.end(), [](const Word& a, const Word& b) { return a.rect.left < b.rect.left; });
-                        int line = nextLine++;
-                        for (auto& w : row) { w.line = line; result->words.push_back(std::move(w)); }
-                    }
+                    appendVisualRows(words, result->words, nextLine);
                 }
             } catch (winrt::hresult_error const& e) { result->error = e.message().c_str(); }
             catch (const std::exception& e) { result->error = widen(e); }
