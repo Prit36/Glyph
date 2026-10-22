@@ -5,6 +5,8 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
 #include <shellapi.h>
 #include <shlobj.h>
 #include <appmodel.h>
@@ -25,6 +27,7 @@
 #include <condition_variable>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <map>
@@ -43,7 +46,7 @@
 using namespace winrt::Windows::Media::Ocr;
 using namespace winrt::Windows::Graphics::Imaging;
 using Clock = std::chrono::steady_clock;
-constexpr UINT WM_TRAY = WM_APP + 1, WM_OCR = WM_APP + 2, WM_ENGINE = WM_APP + 3;
+constexpr UINT WM_TRAY = WM_APP + 1, WM_OCR = WM_APP + 2, WM_ENGINE = WM_APP + 3, WM_DRAG_FRAME = WM_APP + 4;
 constexpr int HOTKEY_ID = 1;
 constexpr wchar_t APP_NAME[] = L"Glyph";
 
@@ -283,6 +286,108 @@ public:
                 CombineRgn(damage.handle, damage.handle, from.handle, RGN_OR) == ERROR) return nullptr;
         }
         return damage.handle;
+    }
+};
+
+class DragFrameClock {
+    HANDLE timer{};
+    HMONITOR monitor{};
+    int64_t frequency{}, period{}, phase{}, lastTarget{}, lastTimingQuery{};
+    int monitorRate{};
+    bool running{}, armed{};
+public:
+    ~DragFrameClock() { stop(); }
+    HANDLE pendingTimer() const { return armed ? timer : nullptr; }
+    int64_t scheduledQpc() const { return lastTarget; }
+    static int64_t now() { LARGE_INTEGER qpc{}; QueryPerformanceCounter(&qpc); return qpc.QuadPart; }
+    // Choose the next submission slot before vblank, never scheduling two
+    // submissions into the same slot.
+    static int64_t deadline(int64_t current, int64_t origin, int64_t interval, int64_t lead, int64_t previous) {
+        int64_t slot = origin - lead;
+        if (slot < current) slot += ((current - slot) / interval) * interval;
+        if (slot < current) slot += interval;
+        return std::max(slot, previous + interval);
+    }
+    bool start(POINT screenPoint) {
+        stop();
+        LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); frequency = value.QuadPart;
+        timer = CreateWaitableTimerEx(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
+        if (!timer) timer = CreateWaitableTimerEx(nullptr, nullptr, 0, TIMER_MODIFY_STATE | SYNCHRONIZE);
+        if (!timer) return false;
+        running = true; configure(screenPoint); return true;
+    }
+    bool request(POINT screenPoint) {
+        if (!running) return false;
+        if (MonitorFromPoint(screenPoint, MONITOR_DEFAULTTONEAREST) != monitor) configure(screenPoint);
+        if (armed) return true;
+        int64_t current = now();
+        if (current - lastTimingQuery > frequency / 4) { synchronize(); current = now(); }
+        int64_t lead = std::min(period / 2, frequency / 500); // <=2 ms for wake-up, painting, and GDI submission
+        int64_t target = deadline(current, phase, period, lead, lastTarget);
+        LARGE_INTEGER due{};
+        due.QuadPart = -std::max<int64_t>(1, (target - current) * 10000000 / frequency);
+        if (!SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) { stop(); return false; }
+        lastTarget = target; armed = true; return true;
+    }
+    void consume() { if (armed) CancelWaitableTimer(timer); armed = false; }
+    void stop() {
+        consume(); if (timer) CloseHandle(timer); timer = nullptr;
+        running = false; monitor = nullptr; lastTarget = lastTimingQuery = 0;
+    }
+private:
+    void configure(POINT screenPoint) {
+        consume(); monitor = MonitorFromPoint(screenPoint, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEX info{}; info.cbSize = sizeof(info);
+        DEVMODE mode{}; mode.dmSize = sizeof(mode);
+        monitorRate = 60;
+        if (GetMonitorInfo(monitor, &info) && EnumDisplaySettings(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+            monitorRate = static_cast<int>(mode.dmDisplayFrequency);
+        period = std::max<int64_t>(1, frequency / monitorRate); phase = now(); lastTarget = 0;
+        synchronize();
+    }
+    void synchronize() {
+        lastTimingQuery = now();
+        DWM_TIMING_INFO timing{}; timing.cbSize = sizeof(timing);
+        // DWM timing is desktop-wide. Use its phase only when its cadence agrees
+        // with the pointer's monitor, retaining that monitor's rate otherwise.
+        // Recheck occasionally during pending input so fractional refresh rates
+        // do not drift away from the compositor over a long drag.
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing)) && timing.qpcRefreshPeriod > 0 && timing.qpcVBlank > 0 &&
+            timing.rateRefresh.uiDenominator && std::lround(static_cast<double>(timing.rateRefresh.uiNumerator) / timing.rateRefresh.uiDenominator) == monitorRate) {
+            period = static_cast<int64_t>(timing.qpcRefreshPeriod); phase = static_cast<int64_t>(timing.qpcVBlank);
+        }
+    }
+};
+
+class DragTrace {
+    struct Sample { int64_t input{}, begin{}, submit{}, scheduled{}; DWORD messageAge{}; DWORD rectangles{}; uint64_t pixels{}; RECT box{}; POINT pointer{}; };
+    std::vector<Sample> samples;
+    std::filesystem::path path;
+    size_t next{};
+    int64_t frequency{};
+public:
+    bool enabled() const { return !path.empty(); }
+    void enable(std::filesystem::path output) {
+        path = std::filesystem::absolute(std::move(output)); samples.reserve(4096);
+        LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); frequency = value.QuadPart;
+    }
+    void record(int64_t input, int64_t begin, DWORD age, DWORD rectangles, uint64_t pixels, RECT box, POINT pointer, int64_t scheduled = 0) {
+        if (!enabled()) return;
+        Sample sample{input, begin, DragFrameClock::now(), scheduled, age, rectangles, pixels, box, pointer};
+        if (samples.size() < 4096) samples.push_back(sample);
+        else { samples[next] = sample; next = (next + 1) % samples.size(); }
+    }
+    void save() const noexcept {
+        if (!enabled()) return;
+        try {
+            std::ofstream output(path);
+            output << "qpc_frequency,input_qpc,paint_begin_qpc,submit_qpc,scheduled_qpc,message_age_ms,rectangles,pixels,left,top,right,bottom,pointer_x,pointer_y\n";
+            for (size_t i = 0; i < samples.size(); ++i) {
+                const auto& s = samples[(next + i) % samples.size()];
+                output << frequency << ',' << s.input << ',' << s.begin << ',' << s.submit << ',' << s.scheduled << ',' << s.messageAge << ',' << s.rectangles << ','
+                    << s.pixels << ',' << s.box.left << ',' << s.box.top << ',' << s.box.right << ',' << s.box.bottom << ',' << s.pointer.x << ',' << s.pointer.y << '\n';
+            }
+        } catch (...) { /* Diagnostic output cannot interfere with closing capture. */ }
     }
 };
 
@@ -1018,6 +1123,13 @@ public:
     double hudStyleScale{};
     BoxDamage boxDamage;
     Region paintRegion;
+    DragFrameClock dragClock;
+    DragTrace dragTrace;
+    bool boxPaintPending{};
+    RECT pendingBoxFrom{};
+    POINT latestPointer{};
+    int64_t latestInput{};
+    DWORD latestMessageTime{};
     HICON icon{};
     bool active{}, recognizing{}, dragging{}, boxMode{}, addRegion{}, quitting{};
     bool hotkeyRegistered{}, movingHud{}, addNext{}, copied{}, trackingMouse{};
@@ -1070,6 +1182,26 @@ public:
         HRGN damage = boxDamage.between(before, after, std::max(1, ui(1)));
         if (damage) InvalidateRgn(window, damage, FALSE);
         else invalidate();
+    }
+    void applyPendingBoxDamage() {
+        dragClock.consume();
+        if (!std::exchange(boxPaintPending, false)) return;
+        invalidateBoxChange(pendingBoxFrom, selectionBox);
+    }
+    void presentDragFrame() {
+        dragClock.consume();
+        if (!active || !dragging || !boxMode || !boxPaintPending || !frame) return;
+        // A ready frame takes priority over queued mouse messages. Sample the
+        // actual pointer now so a burst of input cannot leave the box behind.
+        POINT p{};
+        if (GetCapture() == window && GetCursorPos(&p) && ScreenToClient(window, &p)) {
+            latestPointer = p;
+            selectionBox = dragRegion(dragOrigin, p, frame->image->width, frame->image->height);
+        }
+        applyPendingBoxDamage();
+        // WM_PAINT normally waits behind input. Submit this scheduled frame
+        // directly rather than letting a high-polling mouse postpone it.
+        UpdateWindow(window);
     }
     size_t selectedWords() const {
         return std::count_if(selection.begin(), selection.end(), [](Span s) { return s.begin < s.end; });
@@ -1285,6 +1417,7 @@ public:
     }
     void exitMode() {
         if (!active) return;
+        dragClock.stop(); boxPaintPending = false;
         bool restoreFocus = GetForegroundWindow() == window;
         worker->cancel(); active = false; recognizing = false; dragging = false; ReleaseCapture(); ShowWindow(window, SW_HIDE);
         if (trackingMouse) {
@@ -1296,6 +1429,7 @@ public:
         std::vector<Span>().swap(selection); std::vector<Span>().swap(baseSelection);
         boxDamage.clear(); paintRegion.clear();
         fonts.clear(); highlights.clear(); frame.reset(); releaseCanvas();
+        dragTrace.save();
         if (restoreFocus && IsWindow(previousWindow)) SetForegroundWindow(previousWindow);
     }
     void measure(Word& word, HDC dc, TextMetricsCache& cache) {
@@ -1397,7 +1531,11 @@ public:
         selectionBox = dragRegion(p, p, frame->image->width, frame->image->height);
         invalidateBoxChange(previousBox, selectionBox);
         status = L"Release to read this box. Esc cancels this drag.";
+        latestPointer = p;
+        if (dragTrace.enabled()) { latestInput = DragFrameClock::now(); latestMessageTime = static_cast<DWORD>(GetMessageTime()); }
         SetCapture(window); invalidate(hud);
+        UpdateWindow(window);
+        dragClock.start({p.x + frame->desktop.left, p.y + frame->desktop.top});
     }
     void beginTextSelection(POINT p, bool add) {
         cancelRecognition();
@@ -1461,7 +1599,16 @@ public:
             RECT old = selectionBox;
             selectionBox = dragRegion(dragOrigin, p, frame->image->width, frame->image->height);
             if (EqualRect(&old,&selectionBox)) return;
-            invalidateBoxChange(old, selectionBox); return;
+            latestPointer = p;
+            if (dragTrace.enabled()) { latestInput = DragFrameClock::now(); latestMessageTime = static_cast<DWORD>(GetMessageTime()); }
+            if (dragClock.request({p.x + frame->desktop.left, p.y + frame->desktop.top})) {
+                if (!boxPaintPending) pendingBoxFrom = old;
+                boxPaintPending = true;
+            } else {
+                if (boxPaintPending) { old = pendingBoxFrom; boxPaintPending = false; }
+                invalidateBoxChange(old, selectionBox);
+            }
+            return;
         }
         updateTextSelection(p);
     }
@@ -1511,6 +1658,7 @@ public:
         }
         if (dragging) mouseMove(p);
         finishDrag(true); ReleaseCapture();
+        if (active) UpdateWindow(window);
     }
     void invokeControl(int control) {
         if (control == 1 && canCopy()) copy(false);
@@ -1519,7 +1667,9 @@ public:
     }
     void finishDrag(bool recognize = false) {
         if (!dragging) return;
+        applyPendingBoxDamage(); dragClock.stop();
         dragging = false;
+        dragTrace.save();
         if (!boxMode) { status = L"Ctrl+C to copy  \x00b7  Enter to copy and close"; invalidate(hud); return; }
         if (!recognize || selectionBox.right - selectionBox.left < 3 || selectionBox.bottom - selectionBox.top < 3) {
             RECT old = selectionBox;
@@ -1697,6 +1847,11 @@ public:
         hudText(destination, L"Copy", label, ui(14), enabled ? RGB(25, 28, 33) : RGB(157, 161, 170), textFlags, FW_MEDIUM);
     }
     void paint() {
+        // Exposure/HUD paints may happen before the scheduled drag frame. Fold
+        // in its pending damage so logical and displayed box positions agree.
+        applyPendingBoxDamage();
+        bool traceFrame = active && dragging && boxMode && dragTrace.enabled();
+        int64_t paintBegin = traceFrame ? DragFrameClock::now() : 0;
         // Preserve complex update regions: using only rcPaint would repaint the
         // whole box interior even when just its thin outline changed.
         constexpr DWORD maxRectangles = 256;
@@ -1707,11 +1862,24 @@ public:
             bytes = GetRegionData(update,static_cast<DWORD>(storage.size()),data);
         PAINTSTRUCT ps{}; HDC screen = BeginPaint(window, &ps);
         if (!active || !frame || !canvas) { EndPaint(window, &ps); return; }
+        DWORD rectangles = 0; uint64_t pixels = 0;
         if (bytes && bytes <= storage.size() && data->rdh.nCount <= maxRectangles) {
-            auto rectangles = reinterpret_cast<const RECT*>(data->Buffer);
-            for (DWORD i = 0; i < data->rdh.nCount; ++i) render(screen,rectangles[i]);
-        } else render(screen,ps.rcPaint);
+            auto parts = reinterpret_cast<const RECT*>(data->Buffer);
+            for (DWORD i = 0; i < data->rdh.nCount; ++i) {
+                render(screen,parts[i]);
+                pixels += static_cast<uint64_t>(parts[i].right - parts[i].left) * (parts[i].bottom - parts[i].top);
+            }
+            rectangles = data->rdh.nCount;
+        } else {
+            render(screen,ps.rcPaint);
+            pixels = static_cast<uint64_t>(ps.rcPaint.right - ps.rcPaint.left) * (ps.rcPaint.bottom - ps.rcPaint.top);
+            rectangles = 1;
+        }
         EndPaint(window, &ps);
+        // The last tile's BitBlt must reach the window before we return to
+        // waiting for input. Otherwise its GDI batch can linger until later work.
+        GdiFlush();
+        if (traceFrame) dragTrace.record(latestInput, paintBegin, GetTickCount() - latestMessageTime, rectangles, pixels, selectionBox, latestPointer, dragClock.scheduledQpc());
     }
     void render(HDC screen, RECT damage) {
         RECT bounds{0,0,frame->image->width,frame->image->height};
@@ -1767,6 +1935,7 @@ public:
     }
     void clearSelection() {
         cancelRecognition();
+        applyPendingBoxDamage(); dragClock.stop();
         dragging = movingHud = false; pressed = focused = 0; ReleaseCapture();
         words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear();
         fonts.clear(); highlights.clear(); selectionBox = {}; previousBox = {};
@@ -1901,6 +2070,7 @@ public:
             if (!info->error.empty()) notify(L"OCR engine is unavailable. " + info->error, true); return 0;
         }
         case WM_PAINT: paint(); return 0;
+        case WM_DRAG_FRAME: presentDragFrame(); return 0;
         case WM_ERASEBKGND: return 1;
         case WM_LBUTTONDOWN: mouseDown({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, false); return 0;
         case WM_LBUTTONDBLCLK: mouseDown({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, true); return 0;
@@ -1977,7 +2147,12 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
-    bool captureNow = argc >= 2 && std::wstring(argv[1]) == L"--capture"; LocalFree(argv);
+    bool captureNow = false; std::filesystem::path tracePath;
+    for (int i = 1; i < argc; ++i) {
+        if (std::wstring_view(argv[i]) == L"--capture") captureNow = true;
+        else if (std::wstring_view(argv[i]) == L"--trace-drag" && i + 1 < argc) tracePath = argv[++i];
+    }
+    LocalFree(argv);
     HANDLE mutex = CreateMutex(nullptr, FALSE, L"Local\\Glyph.Desktop.Singleton");
     if (!mutex) return 1;
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -1987,15 +2162,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     int code = 0;
     try {
         App app;
+        if (!tracePath.empty()) app.dragTrace.enable(std::move(tracePath));
         WNDCLASSEX cls{sizeof(cls)}; cls.style = CS_DBLCLKS; cls.lpfnWndProc = windowProc; cls.hInstance = instance;
         cls.hIcon = LoadIcon(instance, MAKEINTRESOURCE(1)); cls.hCursor = LoadCursor(nullptr, IDC_CROSS); cls.lpszClassName = L"GlyphOverlay";
         if (!RegisterClassEx(&cls)) throw std::runtime_error("Cannot register overlay window");
         HWND window = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, cls.lpszClassName, APP_NAME, WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, &app);
         if (!window) throw std::runtime_error("Cannot create overlay window");
         app.initialize(); if (captureNow) PostMessage(window, WM_HOTKEY, HOTKEY_ID, 0);
-        MSG message{}; BOOL result;
-        while ((result = GetMessage(&message, nullptr, 0, 0)) > 0) { TranslateMessage(&message); DispatchMessage(&message); }
-        if (result == -1) { app.shutdown(); code = 1; }
+        MSG message{};
+        for (;;) {
+            if (HANDLE timer = app.dragClock.pendingTimer()) {
+                DWORD ready = MsgWaitForMultipleObjectsEx(1, &timer, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                if (ready == WAIT_OBJECT_0) { SendMessage(window, WM_DRAG_FRAME, 0, 0); continue; }
+                if (ready == WAIT_FAILED) { app.shutdown(); code = 1; break; }
+                // A message wake can contain only sent/internal messages.
+                // GetMessage could block again after dispatching those and
+                // strand the armed timer; PeekMessage keeps this wait bounded.
+                if (!PeekMessage(&message, nullptr, 0, 0, PM_REMOVE)) continue;
+                if (message.message == WM_QUIT) break;
+            } else {
+                BOOL result = GetMessage(&message, nullptr, 0, 0);
+                if (result <= 0) { if (result == -1) { app.shutdown(); code = 1; } break; }
+            }
+            TranslateMessage(&message); DispatchMessage(&message);
+        }
     } catch (winrt::hresult_error const& e) { MessageBox(nullptr, e.message().c_str(), APP_NAME, MB_OK | MB_ICONERROR); code = 1; }
     catch (const std::exception& e) { MessageBox(nullptr, widen(e).c_str(), APP_NAME, MB_OK | MB_ICONERROR); code = 1; }
     CloseHandle(mutex); return code;

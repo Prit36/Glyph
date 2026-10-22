@@ -4,13 +4,16 @@
 #define NOMINMAX
 #include <windows.h>
 BOOL observeInvalidateRect(HWND window, const RECT* area, BOOL erase);
+BOOL observeInvalidateRgn(HWND window, HRGN region, BOOL erase);
 // Hidden windows discard native update regions. Observe the real damage calls
 // so incremental rendering can still be checked without showing an overlay.
 #define InvalidateRect observeInvalidateRect
+#define InvalidateRgn observeInvalidateRgn
 #define wWinMain glyphApplicationEntry
 #include "../src/main.cpp"
 #undef wWinMain
 #undef InvalidateRect
+#undef InvalidateRgn
 #include <fstream>
 #include <iostream>
 
@@ -22,6 +25,10 @@ BOOL observeInvalidateRect(HWND window, const RECT* area, BOOL erase) {
         CombineRgn(observedDamage, observedDamage, part, RGN_OR); DeleteObject(part);
     }
     return InvalidateRect(window, area, erase);
+}
+BOOL observeInvalidateRgn(HWND window, HRGN region, BOOL erase) {
+    if (window == observedWindow && observedDamage && region) CombineRgn(observedDamage, observedDamage, region, RGN_OR);
+    return InvalidateRgn(window, region, erase);
 }
 
 void check(bool value, const char* message) {
@@ -206,6 +213,59 @@ void dragRegressions() {
     }
     check(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) == handles, "Toolbar repaints must not leak GDI handles");
 }
+void framePacingRegressions() {
+    check(DragFrameClock::deadline(1000, 0, 100, 20, 0) == 1080, "Frame deadline must precede refresh");
+    check(DragFrameClock::deadline(1080, 0, 100, 20, 0) == 1080, "Input exactly at deadline must not wait another refresh");
+    check(DragFrameClock::deadline(1081, 0, 100, 20, 1080) == 1180, "Late input must use next frame slot");
+    check(DragFrameClock::deadline(1001, 0, 100, 20, 1080) == 1180, "Frame slots must not be submitted twice");
+    for (int64_t rate : {60, 120, 144, 165, 240}) {
+        int64_t period = 10000000 / rate, lead = std::min<int64_t>(period / 3, 15000), previous = 0;
+        int64_t now = 10000000;
+        for (int input = 0; input < 100; ++input) {
+            int64_t target = DragFrameClock::deadline(now, 9990000, period, lead, previous);
+            check(target >= now && target >= previous + period, "Refresh scheduler cannot schedule in the past or reuse a slot");
+            check(target - now <= period, "Continuous input must not accumulate frame latency");
+            previous = target;
+            now = target + (input % 5 + 1) * 100;
+        }
+    }
+    App app; fixture(app, false, 1.0, 400, 260); app.hud = {};
+    app.window = CreateWindowEx(0, L"STATIC", L"Glyph frame scheduling test", WS_POPUP, 0, 0, 400, 260,
+        nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+    check(app.window != nullptr, "Could not create hidden frame test window");
+    app.active = app.dragging = app.boxMode = true; app.trackingMouse = true;
+    app.dragOrigin = {30, 30}; app.selectionBox = {30, 30, 40, 40};
+    Surface actual(400, 260), expected(400, 260);
+    app.render(actual.dc, {0, 0, 400, 260});
+    Region damage; observedWindow = app.window; observedDamage = damage.get();
+    DWORD handles = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+    check(app.dragClock.start({30, 30}), "Could not start high-resolution frame clock");
+    check(!app.dragClock.pendingTimer(), "Idle drag clock must not wake or poll");
+    RECT original = app.selectionBox;
+    for (int i = 0; i < 500; ++i) app.mouseMove({50 + i % 300, 50 + i % 190});
+    check(app.boxPaintPending && app.dragClock.pendingTimer(), "Mouse burst must arm one deferred paint");
+    check(EqualRect(&original, &app.pendingBoxFrom), "Coalesced damage must retain the displayed starting box");
+    RECT empty{}; check(GetRgnBox(observedDamage, &empty) == NULLREGION, "Mouse burst must not invalidate each intermediate box");
+    app.presentDragFrame();
+    check(!app.boxPaintPending && !app.dragClock.pendingTimer(), "Scheduled frame must consume pending damage and disarm timer");
+    renderRegion(app, actual, observedDamage); SetRectRgn(observedDamage, 0, 0, 0, 0);
+    app.render(expected.dc, {0, 0, 400, 260}); samePixels(actual, expected, "Coalesced box must match full render");
+    app.previousBox = original;
+    app.mouseMove({10, 10}); app.mouseMove({390, 250}); app.finishDrag(false);
+    check(!app.dragClock.pendingTimer() && !app.boxPaintPending, "Cancelled drag must cancel queued frame");
+    renderRegion(app, actual, observedDamage);
+    app.render(expected.dc, {0, 0, 400, 260}); samePixels(actual, expected, "Cancelling pending drag must restore the original pixels");
+    check(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) <= handles + 3, "Frame scheduling must not leak GDI resources");
+    observedWindow = nullptr; observedDamage = nullptr;
+    app.active = false; DestroyWindow(app.window); app.window = nullptr;
+
+    DragTrace trace; trace.enable(L"build/ux-drag-timing.csv");
+    for (int i = 0; i < 4100; ++i) trace.record(i, i, 0, 1, 1, {}, {i, 0});
+    trace.save();
+    std::ifstream recorded("build/ux-drag-timing.csv"); std::string line; size_t rows = 0;
+    while (std::getline(recorded, line)) ++rows;
+    check(rows == 4097, "Timing diagnostics must retain at most 4096 paint samples");
+}
 int main() {
     try {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -331,7 +391,8 @@ int main() {
         }
         DestroyWindow(dialog);
         dragRegressions();
-        std::cout << "PASS: capture geometry, shortcuts, text order, queued copy, drag recovery, stale/error OCR, contrast, DPI fixtures, randomized 100-300% box paints, indexed hits, incremental/additive text selection, and toolbar handle stability.\n";
+        framePacingRegressions();
+        std::cout << "PASS: capture geometry, shortcuts, text order, queued copy, drag recovery, stale/error OCR, contrast, DPI fixtures, randomized 100-300% box paints, indexed hits, incremental/additive text selection, toolbar handle stability, frame scheduling/coalescing/cancellation, and bounded timing diagnostics.\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

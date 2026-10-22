@@ -111,6 +111,8 @@ Tile passes are parallelized across a bounded thread pool (2–4 worker threads)
 
 The executable uses a statically linked C++ runtime. Runtime memory depends on display resolution: the screenshot and bounded rendering buffer alone use about **32.6 MiB for one 4K desktop**. The scratch rendering buffer is capped at 1 MiB (512 × 512 pixels); the reusable toolbar alpha surface adds about 68 KiB at 100% DPI or 273 KiB at 200%. Rendering surfaces, damage regions, large selection containers, and the highlight-row index are released on exit. OCR and other app allocations are additional. See the [drag benchmark results](docs/benchmarks/drag-2026-10-22.md) for measured changes and test conditions.
 
+Box movement is coalesced into refresh-timed submissions, with ready frames prioritized over queued mouse messages and each completed GDI paint explicitly flushed. The one-shot timer is armed only for a changed box and is closed when the gesture ends. See [frame-pacing validation and live tracing](docs/benchmarks/frame-pacing-preview.md) for measured app timings and display-cadence limitations.
+
 ## Limitations
 
 - OCR can misread small, stylized, rotated, or low-contrast text. Character boundaries are estimated from word boxes and font measurements.
@@ -134,6 +136,10 @@ From PowerShell in the repository root:
 .\tests\ux-smoke.ps1
 # Run the offscreen 4K box and 20,000-word selection benchmark:
 .\tests\drag-perf.ps1
+# Check frame scheduling under a synthetic mouse-message stream:
+.\tests\frame-pacing.ps1
+# Build separately for frame-pacing profiling:
+.\build.ps1 -SkipPackage -OutputDirectory dist/frame-pacing-preview
 ```
 
 Output goes to `dist\Glyph.exe` and `dist\Glyph.msix`, with installation scripts and documentation. Compiler intermediates go to `build\`. Both generated directories are excluded from Git.
