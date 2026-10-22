@@ -1,9 +1,28 @@
 #include <windows.h>
+#include "resource.h"
+
+IDD_SETTINGS DIALOGEX 0, 0, 314, 220
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Glyph settings"
+FONT 9, "Segoe UI"
+BEGIN
+ LTEXT "Capture text, with a shortcut that suits you.", -1, 16, 14, 282, 14
+ LTEXT "Activation &shortcut", -1, 16, 39, 282, 12
+ EDITTEXT IDC_SHORTCUT, 16, 53, 282, 22, ES_AUTOHSCROLL | WS_TABSTOP
+ LTEXT "For example: Ctrl+Alt+T or Shift+F8", -1, 16, 79, 282, 12
+ LTEXT "Recognition &language", -1, 16, 100, 282, 12
+ COMBOBOX IDC_LANGUAGE, 16, 114, 282, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+ CONTROL "Start Glyph when I &sign in", IDC_STARTUP, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 146, 282, 14
+ LTEXT "", IDC_SETTINGS_ERROR, 16, 166, 282, 24
+ DEFPUSHBUTTON "&Save", IDOK, 174, 195, 60, 18
+ PUSHBUTTON "Cancel", IDCANCEL, 240, 195, 58, 18
+END
+
 1 RT_MANIFEST "app.manifest"
 1 ICON "..\\assets\\Glyph.ico"
 1 VERSIONINFO
- FILEVERSION 1,2,8,0
- PRODUCTVERSION 1,2,8,0
+ FILEVERSION 1,2,9,0
+ PRODUCTVERSION 1,2,9,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -13,7 +32,7 @@ BEGIN
   BEGIN
    VALUE "FileDescription", "Glyph - screen OCR selection\0"
    VALUE "ProductName", "Glyph\0"
-   VALUE "FileVersion", "1.2.8\0"
+   VALUE "FileVersion", "1.2.9\0"
   END
  END
  BLOCK "VarFileInfo"

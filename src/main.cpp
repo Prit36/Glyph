@@ -2,6 +2,9 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 #include <shellapi.h>
 #include <shlobj.h>
 #include <appmodel.h>
@@ -34,6 +37,8 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <utility>
+#include "resource.h"
 
 using namespace winrt::Windows::Media::Ocr;
 using namespace winrt::Windows::Graphics::Imaging;
@@ -94,18 +99,18 @@ public:
     const TextMetrics& get(int height, const std::wstring& text, HDC dc, FontCache& fonts);
 };
 class FontCache {
-    std::vector<std::pair<int, HFONT>> fonts;
+    std::vector<std::pair<std::pair<int, int>, HFONT>> fonts;
 public:
     static constexpr size_t maxFonts = 64;
     ~FontCache() { clear(); }
-    HFONT get(int height) {
-        for (auto [size, font] : fonts) if (size == height) return font;
-        HFONT font = CreateFont(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    HFONT get(int height, int weight = FW_NORMAL) {
+        for (auto [size, font] : fonts) if (size == std::pair{height, weight}) return font;
+        HFONT font = CreateFont(-height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
         if (!font) throw std::runtime_error("Cannot create selection font metrics");
         // Callers restore their previous font before requesting another one.
         // Keep exact sizes while bounding handles for boxes with many heights.
         if (fonts.size() == maxFonts) { DeleteObject(fonts.front().second); fonts.erase(fonts.begin()); }
-        try { fonts.emplace_back(height, font); }
+        try { fonts.emplace_back(std::pair{height, weight}, font); }
         catch (...) { DeleteObject(font); throw; }
         return font;
     }
@@ -203,11 +208,22 @@ RECT dragRegion(POINT start, POINT end, int width, int height) {
     return {std::min(start.x, end.x), std::min(start.y, end.y), std::max(start.x, end.x), std::max(start.y, end.y)};
 }
 
-std::array<RECT,4> outlineRects(RECT r) {
+std::array<RECT,4> outlineRects(RECT r, int halo = 4) {
     if (IsRectEmpty(&r)) return {};
-    InflateRect(&r,2,2);
-    return {RECT{r.left,r.top,r.right,r.top + 4}, RECT{r.left,r.bottom - 4,r.right,r.bottom},
-        RECT{r.left,r.top,r.left + 4,r.bottom}, RECT{r.right - 4,r.top,r.right,r.bottom}};
+    InflateRect(&r,halo,halo);
+    return {RECT{r.left,r.top,r.right,r.top + halo * 2}, RECT{r.left,r.bottom - halo * 2,r.right,r.bottom},
+        RECT{r.left,r.top,r.left + halo * 2,r.bottom}, RECT{r.right - halo * 2,r.top,r.right,r.bottom}};
+}
+
+HRGN boxDamage(RECT before, RECT after, int halo = 4) {
+    HRGN damage = CreateRectRgnIndirect(&before), part = CreateRectRgnIndirect(&after);
+    bool ok = damage && part && CombineRgn(damage, damage, part, RGN_XOR) != ERROR;
+    for (RECT box : {before, after}) for (RECT edge : outlineRects(box, halo)) {
+        if (ok) ok = SetRectRgn(part, edge.left, edge.top, edge.right, edge.bottom) && CombineRgn(damage, damage, part, RGN_OR) != ERROR;
+    }
+    if (part) DeleteObject(part);
+    if (!ok && damage) { DeleteObject(damage); damage = nullptr; }
+    return damage;
 }
 
 std::shared_ptr<Frame> capture() {
@@ -928,24 +944,25 @@ public:
     std::unique_ptr<Bitmap> canvas;
     HDC renderDc{};
     HGDIOBJ previousCanvas{};
-    HPEN outlinePen{};
     HICON icon{};
     bool active{}, recognizing{}, dragging{}, boxMode{}, addRegion{}, quitting{};
-    bool hotkeyRegistered{};
+    bool hotkeyRegistered{}, movingHud{}, addNext{}, copied{};
+    int hovered{}, pressed{}, focused{}, pendingCopy{};
     uint64_t session{};
     int anchorWord{-1}, anchorCharacter{}, elapsed{};
     double uiScale{1.0};
-    POINT dragOrigin{};
-    RECT hud{}, copyButton{}, closeButton{}, selectionBox{};
+    POINT dragOrigin{}, hudOffset{};
+    RECT hud{}, copyButton{}, closeButton{}, selectionBox{}, previousBox{};
     HWND previousWindow{};
-    std::wstring status, detectedLanguage;
+    HWND settingsWindow{};
+    std::vector<std::wstring> settingsLanguages;
+    std::wstring status, detectedLanguage, lastError;
     UINT taskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
 
     ~App() { releaseCanvas(); if (icon) DestroyIcon(icon); }
     void releaseCanvas() {
         if (renderDc) { SelectObject(renderDc, previousCanvas); DeleteDC(renderDc); renderDc = nullptr; }
         canvas.reset();
-        if (outlinePen) { DeleteObject(outlinePen); outlinePen = nullptr; }
     }
     void allocateCanvas() {
         releaseCanvas();
@@ -955,8 +972,6 @@ public:
         renderDc = CreateCompatibleDC(nullptr);
         if (!renderDc) throw std::runtime_error("Cannot create overlay render device");
         previousCanvas = SelectObject(renderDc,canvas->handle);
-        outlinePen = CreatePen(PS_DOT, 1, RGB(84, 209, 255));
-        if (!outlinePen) throw std::runtime_error("Cannot create selection outline pen");
     }
     int ui(int value) const { return static_cast<int>(std::lround(value * uiScale)); }
     void invalidate() {
@@ -969,7 +984,64 @@ public:
         if (!IntersectRect(&clipped, &bounds, &area)) return;
         InvalidateRect(window, &clipped, FALSE);
     }
-    void invalidateOutline(RECT area) { for (auto edge : outlineRects(area)) invalidate(edge); }
+    void invalidateOutline(RECT area) { for (auto edge : outlineRects(area, std::max(4, ui(4)))) invalidate(edge); }
+    void invalidateBoxChange(RECT before, RECT after) {
+        // Only the area that changed between the clear box and dimmed desktop
+        // needs repainting. Retain separate strips instead of a desktop-sized union.
+        if (!active) return;
+        HRGN damage = boxDamage(before, after, std::max(4, ui(4)));
+        if (damage) { InvalidateRgn(window, damage, FALSE); DeleteObject(damage); }
+        else invalidate();
+    }
+    size_t selectedWords() const {
+        return std::count_if(selection.begin(), selection.end(), [](Span s) { return s.begin < s.end; });
+    }
+    bool canCopy() const { return !recognizing && selectedWords() != 0; }
+    bool hudVisible() const { return !(dragging && boxMode); }
+    RECT monitorWork(POINT p) const {
+        POINT screen{p.x + frame->desktop.left, p.y + frame->desktop.top};
+        MONITORINFO info{sizeof(info)};
+        GetMonitorInfo(MonitorFromPoint(screen, MONITOR_DEFAULTTONEAREST), &info);
+        OffsetRect(&info.rcWork, -frame->desktop.left, -frame->desktop.top);
+        return info.rcWork;
+    }
+    double monitorScale(POINT p) const {
+        POINT screen{p.x + frame->desktop.left, p.y + frame->desktop.top};
+        UINT x = 96, y = 96;
+        GetDpiForMonitor(MonitorFromPoint(screen, MONITOR_DEFAULTTONEAREST), MDT_EFFECTIVE_DPI, &x, &y);
+        return x / 96.0;
+    }
+    void layoutButtons() {
+        closeButton = {hud.right - ui(38), hud.top + ui(8), hud.right - ui(8), hud.bottom - ui(8)};
+        copyButton = {hud.right - ui(131), hud.top + ui(8), hud.right - ui(49), hud.bottom - ui(8)};
+    }
+    void placeHud(POINT p, bool top = false) {
+        RECT old = hud, work = monitorWork(p);
+        uiScale = monitorScale(p);
+        LONG width = std::min(static_cast<LONG>(ui(380)), work.right - work.left - ui(24));
+        LONG left = work.left + (work.right - work.left - width) / 2;
+        LONG height = ui(46), edge = top ? work.top + ui(16) : work.bottom - ui(16) - height;
+        hud = {left, edge, left + width, edge + height}; layoutButtons();
+        invalidate(old); invalidate(hud);
+    }
+    void avoidSelection() {
+        if (!intersects(hud, selectionBox)) return;
+        POINT center{(selectionBox.left + selectionBox.right) / 2, (selectionBox.top + selectionBox.bottom) / 2};
+        // Compare docks using the destination monitor's scale and width.
+        placeHud(center);
+        RECT work = monitorWork(center), overlap{};
+        RECT top{hud.left, work.top + ui(16), hud.right, work.top + ui(62)};
+        RECT bottom{hud.left, work.bottom - ui(62), hud.right, work.bottom - ui(16)};
+        auto area = [&](RECT r) -> int64_t {
+            return IntersectRect(&overlap, &r, &selectionBox) ? static_cast<int64_t>(overlap.right - overlap.left) * (overlap.bottom - overlap.top) : 0;
+        };
+        bool useTop = area(top) < area(bottom);
+        placeHud(center, useTop);
+    }
+    int controlAt(POINT p) const {
+        if (!hudVisible()) return 0;
+        return inside(copyButton, p) ? 1 : inside(closeButton, p) ? 3 : 0;
+    }
     void notify(const std::wstring& text, bool error = false) {
         NOTIFYICONDATA n{sizeof(n)}; n.hWnd = window; n.uID = 1; n.uFlags = NIF_INFO;
         wcscpy_s(n.szInfoTitle, APP_NAME); wcsncpy_s(n.szInfo, text.c_str(), _TRUNCATE); n.dwInfoFlags = error ? NIIF_ERROR : NIIF_INFO;
@@ -988,6 +1060,7 @@ public:
     }
     static bool parseHotkey(Settings& s) {
         std::wstring input = normalize(s.hotkey); UINT mods = 0, key = 0;
+        if (input.empty() || input.back() == L'+') return false;
         size_t start = 0;
         while (start < input.size()) {
             auto end = input.find(L'+', start); auto part = input.substr(start, end - start);
@@ -1009,22 +1082,86 @@ public:
         if (!key || (!mods && !(key >= VK_F1 && key <= VK_F24))) return false;
         s.modifiers = mods; s.key = key; return true;
     }
-    void loadSettings() {
-        wchar_t value[256]{};
-        Settings next;
-        GetPrivateProfileString(L"Glyph", L"hotkey", L"Ctrl+Alt+T", value, 256, config.c_str()); next.hotkey = value;
-        GetPrivateProfileString(L"Glyph", L"language", L"auto", value, 256, config.c_str()); next.language = value;
-        if (!parseHotkey(next)) { notify(L"Invalid shortcut. Use Ctrl+Alt+T, Shift+F8, or another modifier/key combination. Keeping the current shortcut.", true); return; }
+    bool applySettings(Settings next, std::wstring& error) {
+        if (!parseHotkey(next)) { error = L"Use a shortcut such as Ctrl+Alt+T or Shift+F8."; return false; }
         bool changed = (!hotkeyRegistered || next.modifiers != settings.modifiers || next.key != settings.key);
         if (changed) {
             if (hotkeyRegistered) UnregisterHotKey(window, HOTKEY_ID);
             if (!RegisterHotKey(window, HOTKEY_ID, next.modifiers | MOD_NOREPEAT, next.key)) {
                 hotkeyRegistered = RegisterHotKey(window, HOTKEY_ID, settings.modifiers | MOD_NOREPEAT, settings.key) != FALSE;
-                notify(L"The requested shortcut is already used. Change hotkey in Settings, then choose Reload settings. OCR is also available from the tray.", true); return;
+                error = L"That shortcut is in use. Try a different combination."; return false;
             }
             hotkeyRegistered = true;
         }
-        settings = std::move(next); tray(false);
+        settings = std::move(next); tray(false); return true;
+    }
+    void loadSettings() {
+        wchar_t value[256]{};
+        Settings next;
+        GetPrivateProfileString(L"Glyph", L"hotkey", L"Ctrl+Alt+T", value, 256, config.c_str()); next.hotkey = value;
+        GetPrivateProfileString(L"Glyph", L"language", L"auto", value, 256, config.c_str()); next.language = value;
+        std::wstring error;
+        if (!applySettings(std::move(next), error)) notify(error + L" Open Settings from the tray to change it.", true);
+    }
+    static INT_PTR CALLBACK settingsProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp) {
+        auto app = reinterpret_cast<App*>(GetWindowLongPtr(dialog, DWLP_USER));
+        if (message == WM_INITDIALOG) {
+            app = reinterpret_cast<App*>(lp); SetWindowLongPtr(dialog, DWLP_USER, lp);
+            app->settingsWindow = dialog; app->settingsLanguages = {L"auto"};
+            SendDlgItemMessage(dialog, IDC_SHORTCUT, EM_SETLIMITTEXT, 100, 0);
+            SetDlgItemText(dialog, IDC_SHORTCUT, app->settings.hotkey.c_str());
+            HWND combo = GetDlgItem(dialog, IDC_LANGUAGE);
+            SendMessage(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Automatic (Windows languages)"));
+            int selected = 0;
+            for (size_t i = 0; i < app->languages.size(); ++i) {
+                auto label = app->languages[i].second + L" (" + app->languages[i].first + L")";
+                SendMessage(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+                app->settingsLanguages.push_back(app->languages[i].first);
+                if (app->settings.language == app->languages[i].first) selected = static_cast<int>(i + 1);
+            }
+            // Preserve a configured tag even when its OCR feature is unavailable.
+            if (!selected && app->settings.language != L"auto") {
+                auto label = app->settings.language + L" (not installed)";
+                selected = static_cast<int>(SendMessage(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str())));
+                app->settingsLanguages.push_back(app->settings.language);
+            }
+            SendMessage(combo, CB_SETCURSEL, selected, 0);
+            CheckDlgButton(dialog, IDC_STARTUP, app->startupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+            RECT box{}; GetWindowRect(dialog, &box);
+            MONITORINFO info{sizeof(info)}; GetMonitorInfo(MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST), &info);
+            SetWindowPos(dialog, HWND_TOP, info.rcWork.left + (info.rcWork.right - info.rcWork.left - box.right + box.left) / 2,
+                info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - box.bottom + box.top) / 2, 0, 0, SWP_NOSIZE);
+            return TRUE;
+        }
+        if (!app) return FALSE;
+        if (message == WM_DESTROY) { app->settingsWindow = nullptr; app->settingsLanguages.clear(); return TRUE; }
+        if (message == WM_COMMAND && LOWORD(wp) == IDCANCEL) { EndDialog(dialog, 0); return TRUE; }
+        if (message == WM_COMMAND && LOWORD(wp) == IDOK) {
+            wchar_t shortcut[128]{}; GetDlgItemText(dialog, IDC_SHORTCUT, shortcut, 128);
+            Settings next = app->settings, old = app->settings; next.hotkey = shortcut;
+            int language = static_cast<int>(SendDlgItemMessage(dialog, IDC_LANGUAGE, CB_GETCURSEL, 0, 0));
+            if (language >= 0 && language < static_cast<int>(app->settingsLanguages.size())) next.language = app->settingsLanguages[language];
+            std::wstring error;
+            if (!app->applySettings(std::move(next), error)) { SetDlgItemText(dialog, IDC_SETTINGS_ERROR, error.c_str()); return TRUE; }
+            if (!WritePrivateProfileString(L"Glyph", L"hotkey", app->settings.hotkey.c_str(), app->config.c_str()) ||
+                !WritePrivateProfileString(L"Glyph", L"language", app->settings.language.c_str(), app->config.c_str())) {
+                app->applySettings(old, error);
+                WritePrivateProfileString(L"Glyph", L"hotkey", old.hotkey.c_str(), app->config.c_str());
+                WritePrivateProfileString(L"Glyph", L"language", old.language.c_str(), app->config.c_str());
+                SetDlgItemText(dialog, IDC_SETTINGS_ERROR, L"Could not save settings. Check the settings file is writable."); return TRUE;
+            }
+            if ((IsDlgButtonChecked(dialog, IDC_STARTUP) == BST_CHECKED) != app->startupEnabled() && !app->toggleStartup()) {
+                CheckDlgButton(dialog, IDC_STARTUP, app->startupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+                SetDlgItemText(dialog, IDC_SETTINGS_ERROR, L"Shortcut and language saved. Could not change start at login."); return TRUE;
+            }
+            EndDialog(dialog, 1); return TRUE;
+        }
+        return FALSE;
+    }
+    void showSettings() {
+        if (active) exitMode();
+        if (DialogBoxParam(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDD_SETTINGS), window, settingsProc, reinterpret_cast<LPARAM>(this)) == -1)
+            notify(L"Could not open settings. You can still edit settings.ini in the Glyph application-data folder.", true);
     }
     void initialize() {
         PWSTR path{};
@@ -1046,6 +1183,7 @@ public:
         return result;
     }
     void activate() {
+        if (settingsWindow) { SetForegroundWindow(settingsWindow); return; }
         if (active) { exitMode(); return; }
         previousWindow = GetForegroundWindow();
         try {
@@ -1055,18 +1193,13 @@ public:
         catch (const std::exception& e) { frame.reset(); releaseCanvas(); notify(widen(e), true); return; }
         words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear(); detectedLanguage.clear();
         highlights.clear();
-        status = L"Drag a box over text. Release to recognize and select it.";
+        status = L"Drag a box around the text you need.";
         active = true; recognizing = false; dragging = false; boxMode = true; anchorWord = -1; elapsed = 0;
-        selectionBox = {};
+        selectionBox = {}; previousBox = {}; copied = false; lastError.clear();
+        movingHud = false; addNext = false; hovered = pressed = focused = pendingCopy = 0;
         session = ++worker->generation;
         POINT cursor{}; GetCursorPos(&cursor);
-        HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST); MONITORINFO mi{sizeof(mi)}; GetMonitorInfo(monitor, &mi);
-        UINT dpiX = 96, dpiY = 96; GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY); uiScale = dpiX / 96.0;
-        RECT work = mi.rcWork; OffsetRect(&work, -frame->desktop.left, -frame->desktop.top);
-        int width = std::min(static_cast<LONG>(ui(860)), work.right - work.left - ui(24));
-        hud = {work.left + (work.right - work.left - width) / 2, work.top + ui(18), work.left + (work.right - work.left + width) / 2, work.top + ui(104)};
-        copyButton = {hud.right - ui(142), hud.top + ui(12), hud.right - ui(48), hud.top + ui(44)};
-        closeButton = {hud.right - ui(40), hud.top + ui(12), hud.right - ui(10), hud.top + ui(44)};
+        placeHud({cursor.x - frame->desktop.left, cursor.y - frame->desktop.top});
         // Activation only freezes the desktop. Recognition starts on box release.
         SetWindowLongPtr(window, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_APPWINDOW);
         SetWindowPos(window, HWND_TOPMOST, frame->desktop.left, frame->desktop.top, frame->image->width, frame->image->height, SWP_SHOWWINDOW);
@@ -1146,11 +1279,13 @@ public:
         baseSelection = selection;
         highlights.changed();
         elapsed = r.elapsed; detectedLanguage = r.language; recognizing = !r.complete;
-        if (!r.error.empty()) status = L"OCR failed: " + r.error;
-        else if (r.complete && !foundText) status = L"No text found in this box. Draw another box or try another OCR language.";
-        else {
-            auto selected = std::count_if(selection.begin(), selection.end(), [](Span s) { return s.begin < s.end; });
-            status = std::to_wstring(selected) + L" words selected  |  " + detectedLanguage + L"  |  " + std::to_wstring(elapsed) + L" ms  |  Ctrl+C to copy";
+        lastError = r.error;
+        if (!r.error.empty()) status = L"Couldn't read this box. R to retry; right-click for details or language.";
+        else if (r.complete && !foundText) status = L"No text found. Try a larger box or right-click to change language.";
+        else status = detectedLanguage + L"  \x00b7  Ctrl+C to copy  \x00b7  Enter to copy and close";
+        if (r.complete && pendingCopy) {
+            int action = std::exchange(pendingCopy, 0);
+            if (r.error.empty() && selectedWords()) { invalidate(); copy(action == 2, action == 3); return; }
         }
         invalidate();
     }
@@ -1177,18 +1312,22 @@ public:
     }
     void cancelRecognition() {
         if (recognizing) { invalidateOutline(selectionBox); invalidate(hud); }
-        worker->cancel(); session = worker->generation; recognizing = false;
+        worker->cancel(); session = worker->generation; recognizing = false; pendingCopy = 0;
     }
     void beginRegion(POINT p, bool add) {
         if (!active || !frame) return;
         cancelRecognition();
-        boxMode = true; addRegion = add; dragOrigin = p; dragging = true;
+        previousBox = selectionBox;
+        boxMode = true; addRegion = add || addNext; addNext = false; copied = false;
+        dragOrigin = p; dragging = true; focused = 0;
         selectionBox = dragRegion(p, p, frame->image->width, frame->image->height);
-        status = L"Release to recognize and select the text in this box.";
+        invalidateBoxChange(previousBox, selectionBox);
+        status = L"Release to read this box. Esc cancels this drag.";
         SetCapture(window); invalidate(hud);
     }
     void beginTextSelection(POINT p, bool add) {
         cancelRecognition();
+        copied = false; focused = 0;
         if (!add) std::fill(selection.begin(), selection.end(), Span{});
         baseSelection = selection; boxMode = false; dragOrigin = p;
         auto [index, character] = hit(p, true);
@@ -1198,28 +1337,49 @@ public:
     }
     void mouseDown(POINT p, bool doubleClick) {
         if (!active || !frame) return;
-        if (inside(closeButton, p)) { exitMode(); return; }
-        if (inside(copyButton, p)) { copy(false); return; }
-        if (inside(hud, p)) return;
+        focused = 0;
+        if (int control = controlAt(p)) {
+            pressed = control; SetCapture(window); invalidate(hud); return;
+        }
+        if (inside(hud, p)) {
+            movingHud = true; hudOffset = {p.x - hud.left, p.y - hud.top};
+            SetCapture(window); return;
+        }
         bool add = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         if (doubleClick && !words.empty()) {
             auto [index, character] = hit(p, false);
             if (index >= 0) {
                 cancelRecognition();
                 if (!add) std::fill(selection.begin(), selection.end(), Span{});
-                selection[index] = {0, length(words[index])}; invalidate(); return;
+                selection[index] = {0, length(words[index])}; copied = false;
+                status = L"Ctrl+C to copy  \x00b7  Enter to copy and close"; invalidate(); return;
             }
         }
         if (!(GetKeyState(VK_MENU) & 0x8000) || words.empty()) { beginRegion(p, add); return; }
         beginTextSelection(p, add);
     }
     void mouseMove(POINT p) {
+        int over = controlAt(p);
+        if (over != hovered) { hovered = over; invalidate(hud); }
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0}; TrackMouseEvent(&tracking);
+        if (movingHud) {
+            RECT old = hud, work = monitorWork(p);
+            LONG oldWidth = hud.right - hud.left, oldHeight = hud.bottom - hud.top;
+            double scale = monitorScale(p);
+            if (scale != uiScale) invalidateOutline(selectionBox);
+            uiScale = scale;
+            LONG w = std::min(static_cast<LONG>(ui(380)), work.right - work.left - ui(24)), h = ui(46);
+            hudOffset = {MulDiv(hudOffset.x, w, std::max(1L, oldWidth)), MulDiv(hudOffset.y, h, std::max(1L, oldHeight))};
+            LONG x = std::clamp(p.x - hudOffset.x, work.left, std::max(work.left, work.right - w));
+            LONG y = std::clamp(p.y - hudOffset.y, work.top, std::max(work.top, work.bottom - h));
+            hud = {x, y, x + w, y + h}; layoutButtons(); invalidateOutline(selectionBox); invalidate(old); invalidate(hud); return;
+        }
         if (!dragging) return;
         if (boxMode) {
             RECT old = selectionBox;
             selectionBox = dragRegion(dragOrigin, p, frame->image->width, frame->image->height);
             if (EqualRect(&old,&selectionBox)) return;
-            invalidateOutline(old); invalidateOutline(selectionBox); return;
+            invalidateBoxChange(old, selectionBox); return;
         }
         nextSelection = baseSelection;
         auto [index, character] = hit(p, true); if (index < 0) return;
@@ -1248,21 +1408,39 @@ public:
             changed = true;
         }
         selection.swap(nextSelection);
-        if (changed) flush();
+        if (changed) { flush(); copied = false; invalidate(hud); }
+    }
+    void mouseUp(POINT p) {
+        if (movingHud) { movingHud = false; ReleaseCapture(); return; }
+        if (pressed) {
+            int control = std::exchange(pressed, 0); ReleaseCapture(); invalidate(hud);
+            if (control == controlAt(p)) invokeControl(control);
+            return;
+        }
+        if (dragging) mouseMove(p);
+        finishDrag(true); ReleaseCapture();
+    }
+    void invokeControl(int control) {
+        if (control == 1 && canCopy()) copy(false);
+        else if (control == 2) help();
+        else if (control == 3) exitMode();
     }
     void finishDrag(bool recognize = false) {
         if (!dragging) return;
         dragging = false;
-        if (!boxMode) return;
+        if (!boxMode) { status = L"Ctrl+C to copy  \x00b7  Enter to copy and close"; invalidate(hud); return; }
         if (!recognize || selectionBox.right - selectionBox.left < 3 || selectionBox.bottom - selectionBox.top < 3) {
-            status = words.empty() ? L"Drag a box over text. Release to recognize and select it." : L"Draw another box, or press Ctrl+C to copy the selected text.";
+            selectionBox = previousBox;
+            status = words.empty() ? L"Drag a box around the text you need." : L"Selection kept. Ctrl+C to copy or draw another box.";
             invalidate(); return;
         }
         if (!addRegion) {
             words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear();
             fonts.clear(); highlights.clear(); detectedLanguage.clear();
         }
-        recognizing = true; elapsed = 0; status = L"Recognizing selected box...";
+        recognizing = true; copied = false; lastError.clear(); elapsed = 0;
+        status = L"Reading this box. You can press Enter to copy as soon as it's ready.";
+        avoidSelection();
         session = ++worker->generation;
         worker->submit({session, frame, selectionBox, settings.language, Clock::now()});
         invalidate();
@@ -1281,10 +1459,24 @@ public:
         }
         return output;
     }
-    void copy(bool exitAfter) {
-        if (recognizing) { status = L"Recognizing selected box... Text will be selected automatically when ready."; invalidate(hud); return; }
+    static std::wstring singleLine(std::wstring_view text) {
+        std::wstring output; bool space = false;
+        for (wchar_t c : text) {
+            if (iswspace(c)) { space = !output.empty(); continue; }
+            if (space) output += L' ';
+            output += c; space = false;
+        }
+        return output;
+    }
+    void copy(bool exitAfter, bool oneLine = false) {
+        if (recognizing) {
+            pendingCopy = exitAfter ? 2 : oneLine ? 3 : 1;
+            status = exitAfter ? L"Will copy and close when ready. Esc cancels." : L"Will copy when ready. Esc cancels.";
+            invalidate(hud); return;
+        }
         auto text = selectedText();
-        if (text.empty()) { status = L"Drag a box over text and release to recognize and select it."; invalidate(hud); return; }
+        if (oneLine) text = singleLine(text);
+        if (text.empty()) { status = L"Draw a box around text first."; invalidate(hud); return; }
         size_t bytes = (text.size() + 1) * sizeof(wchar_t); HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
         if (!memory) { status = L"Could not allocate clipboard memory."; invalidate(hud); return; }
         auto pointer = GlobalLock(memory);
@@ -1293,15 +1485,114 @@ public:
         if (!OpenClipboard(window)) { GlobalFree(memory); status = L"Clipboard is busy. Press Ctrl+C again."; invalidate(hud); return; }
         bool ok = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, memory); CloseClipboard();
         if (!ok) { GlobalFree(memory); status = L"Windows could not write the clipboard."; invalidate(hud); return; }
-        status = L"Copied " + std::to_wstring(text.size()) + L" characters. Draw another box, or press Esc to return.";
+        copied = true;
+        status = std::to_wstring(text.size()) + (oneLine ? L" characters copied as one line. Esc to close." : L" characters copied. Ctrl-drag to add more; Esc to close.");
         if (exitAfter) exitMode(); else invalidate(hud);
     }
     static void fill(HDC dc, RECT r, COLORREF color) {
         SetDCBrushColor(dc,color); FillRect(dc,&r,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     }
-    void hudText(HDC dc, const std::wstring& value, RECT r, int size, COLORREF color, UINT flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS) {
-        auto previous = SelectObject(dc, fonts.get(size)); SetTextColor(dc, color); SetBkMode(dc, TRANSPARENT);
+    static void stroke(HDC dc, RECT r, int width, COLORREF color) {
+        fill(dc, {r.left, r.top, r.right, r.top + width}, color);
+        fill(dc, {r.left, r.bottom - width, r.right, r.bottom}, color);
+        fill(dc, {r.left, r.top, r.left + width, r.bottom}, color);
+        fill(dc, {r.right - width, r.top, r.right, r.bottom}, color);
+    }
+    void hudText(HDC dc, const std::wstring& value, RECT r, int size, COLORREF color, UINT flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS, int weight = FW_NORMAL) {
+        auto previous = SelectObject(dc, fonts.get(size, weight)); SetTextColor(dc, color); SetBkMode(dc, TRANSPARENT);
         DrawText(dc, value.c_str(), static_cast<int>(value.size()), &r, flags | DT_NOPREFIX); SelectObject(dc, previous);
+    }
+    void renderHud(HDC destination) {
+        // Render flat shapes into a small premultiplied surface; labels are
+        // drawn directly onto the opaque destination below.
+        struct DrawingRuntime {
+            ULONG_PTR token{};
+            DrawingRuntime() { Gdiplus::GdiplusStartupInput input; if (Gdiplus::GdiplusStartup(&token, &input, nullptr) != Gdiplus::Ok) throw std::runtime_error("Cannot initialize toolbar drawing"); }
+            ~DrawingRuntime() { Gdiplus::GdiplusShutdown(token); }
+        };
+        static DrawingRuntime runtime;
+        using namespace Gdiplus;
+        int margin = 0, width = hud.right - hud.left, height = hud.bottom - hud.top;
+        // Center the icon and measured label as one unit, at device-pixel bounds.
+        SIZE copyExtent{};
+        auto oldFont = SelectObject(destination, fonts.get(ui(14), FW_MEDIUM));
+        GetTextExtentPoint32(destination, L"Copy", 4, &copyExtent);
+        SelectObject(destination, oldFont);
+        int groupWidth = ui(14) + ui(7) + copyExtent.cx;
+        int iconLeft = copyButton.left + (copyButton.right - copyButton.left - groupWidth) / 2;
+        int iconTop = copyButton.top + (copyButton.bottom - copyButton.top - ui(14)) / 2;
+        ::Bitmap surface(width + margin * 2, height + margin * 2);
+        memset(surface.pixels, 0, static_cast<size_t>(surface.width) * surface.height * 4);
+        Gdiplus::Bitmap image(surface.width, surface.height, surface.width * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(surface.pixels));
+        {
+            Graphics g(&image); g.SetSmoothingMode(SmoothingModeAntiAlias); g.SetPixelOffsetMode(PixelOffsetModeHalf);
+            auto rounded = [&](RectF rect, float radius, Brush& brush, Pen* pen = nullptr) {
+                GraphicsPath path; float d = radius * 2;
+                path.AddArc(rect.X, rect.Y, d, d, 180, 90); path.AddArc(rect.GetRight()-d, rect.Y, d, d, 270, 90);
+                path.AddArc(rect.GetRight()-d, rect.GetBottom()-d, d, d, 0, 90); path.AddArc(rect.X, rect.GetBottom()-d, d, d, 90, 90); path.CloseFigure();
+                g.FillPath(&brush, &path); if (pen) g.DrawPath(pen, &path);
+            };
+            float m = static_cast<float>(margin), w = static_cast<float>(width), h = static_cast<float>(height);
+            RectF panel(m, m, w-1, h-1);
+            SolidBrush panelFill(Color(255, 29, 30, 33));
+            Pen border(Color(255, 43, 44, 48), static_cast<float>(uiScale));
+            rounded(panel, static_cast<float>(ui(10)), panelFill, &border);
+            bool enabled = canCopy();
+            RectF button(m+copyButton.left-hud.left, m+copyButton.top-hud.top, static_cast<float>(copyButton.right-copyButton.left), static_cast<float>(copyButton.bottom-copyButton.top));
+            Color buttonColor = enabled ? (pressed == 1 ? Color(255,220,220,223) : hovered == 1 ? Color(255,255,255,255) : Color(255,244,244,245)) : Color(255,48,50,54);
+            SolidBrush buttonFill(buttonColor); Pen focus(Color(255,160,189,218), static_cast<float>(std::max(1, ui(1))));
+            rounded(button, static_cast<float>(ui(7)), buttonFill, focused == 1 ? &focus : nullptr);
+            Pen divider(Color(255, 60, 62, 68), static_cast<float>(std::max(1, ui(1))));
+            // Balance the visible gap, rather than the larger close hit target.
+            int closeGlyphLeft = (closeButton.left + closeButton.right) / 2 - ui(5);
+            float dividerX = static_cast<float>((copyButton.right + closeGlyphLeft) / 2 - hud.left - ui(2));
+            g.DrawLine(&divider, dividerX, static_cast<float>(ui(13)), dividerX, static_cast<float>(height-ui(13)));
+            RectF close(m+closeButton.left-hud.left, m+closeButton.top-hud.top, static_cast<float>(closeButton.right-closeButton.left), static_cast<float>(closeButton.bottom-closeButton.top));
+            if (hovered == 3 || focused == 3) { SolidBrush hover(pressed == 3 ? Color(255,59,60,65) : Color(255,43,44,49)); rounded(close, static_cast<float>(ui(5)), hover, focused == 3 ? &focus : nullptr); }
+            Pen cross(Color(255,176,180,190), static_cast<float>(uiScale*1.4)); cross.SetStartCap(LineCapRound); cross.SetEndCap(LineCapRound);
+            float cx = close.X+close.Width/2, cy = close.Y+close.Height/2, arm = static_cast<float>(ui(5));
+            g.DrawLine(&cross,cx-arm,cy-arm,cx+arm,cy+arm); g.DrawLine(&cross,cx+arm,cy-arm,cx-arm,cy+arm);
+        }
+        HDC source = CreateCompatibleDC(destination); auto previous = SelectObject(source, surface.handle);
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        AlphaBlend(destination, hud.left-margin, hud.top-margin, surface.width, surface.height, source, 0, 0, surface.width, surface.height, blend);
+        SelectObject(source, previous); DeleteDC(source);
+        // Small orthogonal icon edges must land on whole device pixels. Draw
+        // these directly, without fractional GDI+ strokes or alpha filtering.
+        COLORREF iconInk = canCopy() ? RGB(32, 35, 41) : RGB(122, 125, 134);
+        COLORREF iconBackground = !canCopy() ? RGB(48, 50, 54) : pressed == 1 ? RGB(220, 220, 223) :
+            hovered == 1 ? RGB(255, 255, 255) : RGB(244, 244, 245);
+        HPEN iconPen = CreatePen(PS_SOLID, std::max(1, ui(1)), iconInk);
+        auto previousPen = SelectObject(destination, iconPen);
+        auto previousBrush = SelectObject(destination, GetStockObject(DC_BRUSH));
+        SetDCBrushColor(destination, iconBackground);
+        int edge = ui(11), offset = ui(3), corner = ui(3);
+        RoundRect(destination, iconLeft, iconTop, iconLeft + edge, iconTop + edge, corner, corner);
+        RoundRect(destination, iconLeft + offset, iconTop + offset,
+            iconLeft + offset + edge, iconTop + offset + edge, corner, corner);
+        SelectObject(destination, previousBrush); SelectObject(destination, previousPen); DeleteObject(iconPen);
+        // Draw labels last, on the opaque final canvas. Native ClearType keeps
+        // small glyphs sharp; drawing onto a transparent alpha surface cannot
+        // preserve the same subpixel coverage.
+        auto count = selectedWords();
+        std::wstring heading = recognizing ? (pendingCopy ? L"Reading, then copying..." : L"Reading text...") :
+            copied ? L"Copied to clipboard" : addNext ? L"Select more text" : !lastError.empty() ? L"Couldn't read text" :
+            count ? std::to_wstring(count) + (count == 1 ? L" word selected" : L" words selected") :
+            !IsRectEmpty(&selectionBox) ? L"No text found" : L"Drag to select text";
+        if (status.starts_with(L"Could not") || status.starts_with(L"Clipboard") || status.starts_with(L"Windows could not") || status.starts_with(L"Couldn't save")) heading = status;
+        RECT title{hud.left + ui(20), hud.top, copyButton.left - ui(12), hud.bottom};
+        constexpr UINT textFlags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
+        if (count && !recognizing && !copied && !addNext && lastError.empty() && heading != status) {
+            auto number = std::to_wstring(count); SIZE extent{};
+            auto previousFont = SelectObject(destination, fonts.get(ui(14), FW_BOLD));
+            GetTextExtentPoint32(destination, number.c_str(), static_cast<int>(number.size()), &extent);
+            SelectObject(destination, previousFont);
+            hudText(destination, number, title, ui(14), RGB(245, 246, 248), textFlags, FW_BOLD);
+            title.left += extent.cx;
+            hudText(destination, count == 1 ? L" word selected" : L" words selected", title, ui(14), RGB(188, 192, 202));
+        } else hudText(destination, heading, title, ui(14), RGB(225, 227, 233));
+        RECT label{iconLeft + ui(14) + ui(7), copyButton.top, copyButton.right - ui(6), copyButton.bottom};
+        hudText(destination, L"Copy", label, ui(14), canCopy() ? RGB(25, 28, 33) : RGB(157, 161, 170), textFlags, FW_MEDIUM);
     }
     void paint() {
         // Preserve complex update regions: using only rcPaint would repaint the
@@ -1333,7 +1624,9 @@ public:
         HDC dc = renderDc;
         POINT origin{damage.left,damage.top};
         // Finish previous GDI writes before accessing the DIB pixels directly.
-        GdiFlush(); blendRect(*canvas, *frame->image, damage, 0x00080e16, 33,origin);
+        GdiFlush(); blendRect(*canvas, *frame->image, damage, 0x00080e16, 62,origin);
+        RECT clear{};
+        if (IntersectRect(&clear, &selectionBox, &damage)) blendRect(*canvas, *frame->image, clear, 0, 0, origin);
         SelectClipRgn(dc,nullptr); SetViewportOrgEx(dc,-damage.left,-damage.top,nullptr);
         IntersectClipRect(dc, damage.left, damage.top, damage.right, damage.bottom);
         // The row index survives character-selection changes. Only words on
@@ -1341,32 +1634,95 @@ public:
         highlights.intersecting(damage, words, selection, [&](RECT clipped) {
             blendRect(*canvas, *frame->image, clipped, 0x00258cde, 76,origin);
         });
-        if ((dragging && boxMode) || recognizing) {
-            SetBkMode(dc,TRANSPARENT);
-            auto oldPen = SelectObject(dc, outlinePen), oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-            Rectangle(dc, selectionBox.left, selectionBox.top, selectionBox.right, selectionBox.bottom);
-            SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
+        if (!IsRectEmpty(&selectionBox)) {
+            int unit = std::max(1, ui(1));
+            RECT border = selectionBox; InflateRect(&border, unit * 3, unit * 3);
+            stroke(dc, border, unit * 4, RGB(8, 17, 27));
+            InflateRect(&border, -unit, -unit);
+            stroke(dc, border, unit * 2, RGB(92, 219, 255));
         }
-        if (intersects(hud, damage)) {
-        fill(dc, hud, RGB(17, 27, 40)); RECT stripe{hud.left, hud.top, hud.left + ui(4), hud.bottom}; fill(dc, stripe, RGB(66, 192, 245));
-        RECT title{hud.left + ui(18), hud.top + ui(9), copyButton.left - ui(10), hud.top + ui(36)};
-        hudText(dc, recognizing ? L"Glyph  /  OCR MODE  /  Recognizing box..." : L"Glyph  /  OCR MODE  /  Draw a box", title, ui(19), RGB(242, 247, 255));
-        fill(dc, copyButton, RGB(34, 106, 151)); hudText(dc, L"Copy", copyButton, ui(15), RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        hudText(dc, L"\x00d7", closeButton, ui(24), RGB(226, 235, 244), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        RECT help{hud.left + ui(18), hud.top + ui(38), hud.right - ui(14), hud.top + ui(59)};
-        hudText(dc, L"Drag: OCR box   Ctrl-drag: add box   Alt-drag: text   Ctrl+C: copy   Enter: copy & exit   Esc: exit", help, ui(13), RGB(166, 188, 210));
-        RECT detail{hud.left + ui(18), hud.top + ui(60), hud.right - ui(14), hud.bottom - ui(5)};
-        hudText(dc, status, detail, ui(13), RGB(107, 207, 237));
-        }
+        RECT toolbarDamage = hud;
+        if (hudVisible() && intersects(toolbarDamage, damage)) renderHud(dc);
+
         BitBlt(screen, damage.left, damage.top, damage.right - damage.left, damage.bottom - damage.top, dc, damage.left, damage.top, SRCCOPY);
+    }
+    void help() {
+        MessageBox(window, (L"Press " + settings.hotkey + L" to capture screen text.\n\nCAPTURE\nDrag a box around text, then release.\nCtrl-drag adds another box. The toolbar can be dragged out of the way.\n\nSELECT\nAlt-drag refines text. Ctrl+Alt-drag adds a text range.\nDouble-click selects a word. Ctrl+A selects all recognized text.\n\nCOPY\nCtrl+C copies and keeps capture open.\nEnter copies and closes. You can press it while text is being read.\nCtrl+Shift+C copies as one line.\n\nRECOVER\nR retries the last box. Backspace clears the selection.\nEsc cancels a drag; otherwise it closes capture.\nRight-click for actions and OCR language.\nTab focuses toolbar buttons; Space or Enter activates them.\nF1 opens this help.\n\nText recognition runs locally. Screenshots stay in memory until capture closes.").c_str(),
+            L"Glyph shortcuts", MB_OK | MB_ICONINFORMATION);
+    }
+    void retry() {
+        if (IsRectEmpty(&selectionBox)) return;
+        cancelRecognition(); previousBox = selectionBox;
+        boxMode = true; dragging = true; finishDrag(true);
+    }
+    void clearSelection() {
+        cancelRecognition();
+        dragging = movingHud = false; pressed = focused = 0; ReleaseCapture();
+        words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear();
+        fonts.clear(); highlights.clear(); selectionBox = {}; previousBox = {};
+        copied = false; addNext = false; lastError.clear(); detectedLanguage.clear();
+        status = L"Selection cleared. Drag a new box around text."; invalidate();
+    }
+    HMENU languageMenu() const {
+        HMENU result = CreatePopupMenu();
+        AppendMenu(result, MF_STRING | (settings.language == L"auto" ? MF_CHECKED : 0), 100, L"Automatic (Windows languages)");
+        for (size_t i = 0; i < languages.size(); ++i) {
+            auto label = languages[i].second + L" (" + languages[i].first + L")";
+            AppendMenu(result, MF_STRING | (settings.language == languages[i].first ? MF_CHECKED : 0), 101 + i, label.c_str());
+        }
+        return result;
+    }
+    void chooseLanguage(UINT command) {
+        if (command < 100 || command > 100 + languages.size()) return;
+        auto language = command == 100 ? L"auto" : languages[command - 101].first;
+        if (!WritePrivateProfileString(L"Glyph", L"language", language.c_str(), config.c_str())) {
+            if (active) { status = L"Couldn't save the language. Check that settings.ini is writable."; invalidate(hud); }
+            else notify(L"Couldn't save the language setting.", true);
+            return;
+        }
+        settings.language = language;
+        if (active) retry();
+    }
+    void captureMenu() {
+        if (!active) return;
+        if (dragging) { finishDrag(); ReleaseCapture(); }
+        HMENU popup = CreatePopupMenu();
+        UINT copyFlags = MF_STRING | (canCopy() || recognizing ? 0 : MF_GRAYED);
+        AppendMenu(popup, copyFlags, 1, L"Copy text\tCtrl+C");
+        AppendMenu(popup, copyFlags, 2, L"Copy and close\tEnter");
+        AppendMenu(popup, copyFlags, 3, L"Copy as one line\tCtrl+Shift+C");
+        AppendMenu(popup, MF_SEPARATOR, 0, nullptr);
+        AppendMenu(popup, MF_STRING, 4, L"Add another box\tCtrl-drag");
+        AppendMenu(popup, MF_STRING | (IsRectEmpty(&selectionBox) ? MF_GRAYED : 0), 5, L"Retry this box\tR");
+        AppendMenu(popup, MF_STRING, 6, L"Clear selection\tBackspace");
+        AppendMenu(popup, MF_POPUP, reinterpret_cast<UINT_PTR>(languageMenu()), L"Recognition language");
+        if (!lastError.empty()) AppendMenu(popup, MF_STRING, 7, L"Error details...");
+        AppendMenu(popup, MF_SEPARATOR, 0, nullptr);
+        AppendMenu(popup, MF_STRING, 8, L"Shortcuts\tF1");
+        AppendMenu(popup, MF_STRING, 9, L"Close capture\tEsc");
+        POINT p{}; GetCursorPos(&p);
+        UINT command = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, window, nullptr);
+        DestroyMenu(popup);
+        switch (command) {
+        case 1: copy(false); break;
+        case 2: copy(true); break;
+        case 3: copy(false, true); break;
+        case 4: addNext = true; status = L"Drag another box. Its text will be added to your selection."; invalidate(hud); break;
+        case 5: retry(); break;
+        case 6: clearSelection(); break;
+        case 7: MessageBox(window, lastError.c_str(), L"Recognition error", MB_OK | MB_ICONINFORMATION); break;
+        case 8: help(); break;
+        case 9: exitMode(); break;
+        default: chooseLanguage(command); break;
+        }
     }
     bool startupEnabled() {
         HKEY key{}; if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return false;
         auto result = RegQueryValueEx(key, APP_NAME, nullptr, nullptr, nullptr, nullptr); RegCloseKey(key); return result == ERROR_SUCCESS;
     }
-    void toggleStartup() {
+    bool toggleStartup() {
         bool enabled = startupEnabled(); HKEY key{};
-        if (RegCreateKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) { notify(L"Could not update start at login.", true); return; }
+        if (RegCreateKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) { notify(L"Could not update start at login.", true); return false; }
         LSTATUS result;
         if (enabled) result = RegDeleteValue(key, APP_NAME);
         else {
@@ -1375,7 +1731,7 @@ public:
             std::wstring command;
             if (packaged == ERROR_INSUFFICIENT_BUFFER) {
                 UINT32 n = 0; GetCurrentApplicationUserModelId(&n, nullptr); std::wstring id(n, L'\0');
-                if (GetCurrentApplicationUserModelId(&n, id.data()) != ERROR_SUCCESS) { RegCloseKey(key); notify(L"Could not resolve package activation.", true); return; }
+                if (GetCurrentApplicationUserModelId(&n, id.data()) != ERROR_SUCCESS) { RegCloseKey(key); notify(L"Could not resolve package activation.", true); return false; }
                 if (!id.empty() && !id.back()) id.pop_back();
                 command = L"explorer.exe shell:AppsFolder\\" + id;
             } else {
@@ -1384,18 +1740,14 @@ public:
             result = RegSetValueEx(key, APP_NAME, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()), static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
         }
         RegCloseKey(key); if (result != ERROR_SUCCESS) notify(L"Could not update start at login.", true);
+        return result == ERROR_SUCCESS;
     }
     void menu() {
-        HMENU menu = CreatePopupMenu(), languageMenu = CreatePopupMenu();
+        HMENU menu = CreatePopupMenu();
         AppendMenu(menu, MF_STRING, 10, (L"Select screen text    " + settings.hotkey).c_str());
         AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenu(languageMenu, MF_STRING | (settings.language == L"auto" ? MF_CHECKED : 0), 100, L"Automatic (Windows languages)");
-        for (size_t i = 0; i < languages.size(); ++i) {
-            auto label = languages[i].second + L" (" + languages[i].first + L")";
-            AppendMenu(languageMenu, MF_STRING | (settings.language == languages[i].first ? MF_CHECKED : 0), 101 + i, label.c_str());
-        }
-        AppendMenu(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(languageMenu), L"OCR language");
-        AppendMenu(menu, MF_STRING, 11, L"Settings (shortcut & language)");
+        AppendMenu(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(languageMenu()), L"OCR language");
+        AppendMenu(menu, MF_STRING, 11, L"Settings...");
         AppendMenu(menu, MF_STRING, 12, L"Reload settings");
         AppendMenu(menu, MF_STRING | (startupEnabled() ? MF_CHECKED : 0), 13, L"Start at login");
         AppendMenu(menu, MF_STRING, 14, L"Help");
@@ -1405,16 +1757,13 @@ public:
         DestroyMenu(menu); PostMessage(window, WM_NULL, 0, 0);
         switch (command) {
         case 10: activate(); break;
-        case 11: ShellExecute(window, L"open", L"notepad.exe", (L"\"" + config.wstring() + L"\"").c_str(), nullptr, SW_SHOWNORMAL); break;
+        case 11: showSettings(); break;
         case 12: loadSettings(); break;
         case 13: toggleStartup(); break;
-        case 14: MessageBox(window, (L"Press " + settings.hotkey + L" to freeze the screen. No OCR runs until you draw a box.\n\nDrag a box over text and release. Only that box is recognized, and its text is selected automatically.\nCtrl-drag adds another box. Alt-drag adjusts the character selection in recognized text. Double-click selects a recognized word.\nCtrl+A selects all recognized text. Ctrl+C copies. Enter copies and exits.\nEsc returns to the desktop.\n\nChange the shortcut or OCR language through Settings, then Reload settings.\nWindows OCR language features must be installed.\nScreenshots are kept in memory only during OCR mode.\n\nIf Windows blocks OCR, use the MSIX installation included with this app.").c_str(), APP_NAME, MB_OK | MB_ICONINFORMATION); break;
+        case 14: help(); break;
         case 15: shutdown(); break;
         default:
-            if (command >= 100 && command <= 100 + languages.size()) {
-                settings.language = command == 100 ? L"auto" : languages[command - 101].first;
-                WritePrivateProfileString(L"Glyph", L"language", settings.language.c_str(), config.c_str());
-            }
+            chooseLanguage(command);
         }
     }
     void shutdown() {
@@ -1446,27 +1795,53 @@ public:
         case WM_LBUTTONDOWN: mouseDown({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, false); return 0;
         case WM_LBUTTONDBLCLK: mouseDown({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, true); return 0;
         case WM_MOUSEMOVE: mouseMove({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}); return 0;
-        case WM_LBUTTONUP: if (dragging) mouseMove({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}); finishDrag(true); ReleaseCapture(); return 0;
-        case WM_CAPTURECHANGED: finishDrag(); return 0;
-        case WM_CANCELMODE: finishDrag(); ReleaseCapture(); return 0;
+        case WM_LBUTTONUP: mouseUp({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}); return 0;
+        case WM_CAPTURECHANGED: movingHud = false; pressed = 0; finishDrag(); invalidate(hud); return 0;
+        case WM_CANCELMODE: movingHud = false; pressed = 0; finishDrag(); ReleaseCapture(); return 0;
+        case WM_MOUSELEAVE: hovered = 0; invalidate(hud); return 0;
+        case WM_CONTEXTMENU: captureMenu(); return 0;
         case WM_SETCURSOR:
             if (active && LOWORD(lp) == HTCLIENT) {
                 POINT p{}; GetCursorPos(&p); ScreenToClient(window, &p);
-                SetCursor(LoadCursor(nullptr, inside(hud, p) ? IDC_ARROW : (!words.empty() && (GetKeyState(VK_MENU) & 0x8000) ? IDC_IBEAM : IDC_CROSS)));
+                int control = controlAt(p);
+                SetCursor(LoadCursor(nullptr, control ? (control == 1 && !canCopy() ? IDC_ARROW : IDC_HAND) :
+                    hudVisible() && inside(hud, p) ? IDC_SIZEALL : (!words.empty() && (GetKeyState(VK_MENU) & 0x8000) ? IDC_IBEAM : IDC_CROSS)));
                 return TRUE;
             }
             break;
         case WM_SYSKEYDOWN:
+            if (wp == VK_F4) return DefWindowProc(window, message, wp, lp);
+            [[fallthrough]];
         case WM_KEYDOWN:
             if (!active) break;
-            if (wp == VK_ESCAPE) exitMode();
-            else if (wp == VK_RETURN) copy(true);
-            else if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == 'C') copy(false);
-            else if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == 'A') { for (size_t i = 0; i < words.size(); ++i) selection[i] = {0, length(words[i])}; invalidate(); }
+            if (wp == VK_ESCAPE) {
+                if (dragging) { finishDrag(); ReleaseCapture(); }
+                else exitMode();
+            }
+            else if (dragging || movingHud || pressed) return 0;
+            else if (wp == VK_TAB) {
+                int direction = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
+                if (!focused) focused = direction > 0 ? 1 : 3;
+                else focused = focused == 1 ? 3 : 1;
+                if (focused == 1 && !canCopy()) focused = 3;
+                invalidate(hud);
+            }
+            else if (wp == VK_RETURN) { if (focused) invokeControl(focused); else copy(true); }
+            else if (wp == VK_SPACE && focused) invokeControl(focused);
+            else if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == 'C') copy(false, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+            else if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == 'A') {
+                for (size_t i = 0; i < words.size(); ++i) selection[i] = {0, length(words[i])};
+                copied = false; invalidate();
+            }
+            else if (wp == VK_F1) help();
+            else if (wp == 'R') retry();
+            else if (wp == VK_BACK) clearSelection();
+            else if (wp == VK_APPS || (wp == VK_F10 && (GetKeyState(VK_SHIFT) & 0x8000))) captureMenu();
             return 0;
         case WM_DISPLAYCHANGE: if (active) { exitMode(); notify(L"Display layout changed. Press the shortcut to capture again."); } return 0;
         case WM_DPICHANGED: invalidate(); return 0;
-        case WM_CLOSE: shutdown(); return 0;
+        case WM_ACTIVATEAPP: if (!wp && active) exitMode(); return 0;
+        case WM_CLOSE: if (active) exitMode(); else shutdown(); return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
         case WM_QUERYENDSESSION: return TRUE;
         case WM_ENDSESSION: if (wp) shutdown(); return 0;

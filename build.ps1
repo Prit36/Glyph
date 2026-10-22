@@ -1,8 +1,8 @@
-param([switch]$SkipPackage)
+param([switch]$SkipPackage, [string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
 $buildDir = Join-Path $projectRoot 'build'
-$distDir = Join-Path $projectRoot 'dist'
+$distDir = if (!$OutputDirectory) { Join-Path $projectRoot 'dist' } elseif ([System.IO.Path]::IsPathRooted($OutputDirectory)) { [System.IO.Path]::GetFullPath($OutputDirectory) } else { [System.IO.Path]::GetFullPath((Join-Path $projectRoot $OutputDirectory)) }
 New-Item -ItemType Directory -Force -Path $buildDir, $distDir | Out-Null
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (!(Test-Path -LiteralPath $vswhere)) { throw 'Install Visual Studio Build Tools with Desktop development with C++ and a Windows 10/11 SDK.' }
@@ -33,7 +33,8 @@ if ($LASTEXITCODE -ne 0) { throw "Compilation failed ($LASTEXITCODE)." }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination $distDir -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'install.ps1'), (Join-Path $projectRoot 'uninstall.ps1') -Destination $distDir -Force
 if (!$SkipPackage) {
-    $packageDir = Join-Path $buildDir 'package'
+    # Stage each package from scratch so files from older builds cannot leak in.
+    $packageDir = Join-Path $buildDir ('package-' + [guid]::NewGuid().ToString('N'))
     $assetsDir = Join-Path $packageDir 'Assets'
     New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $distDir 'Glyph.exe') -Destination $packageDir -Force
@@ -41,6 +42,9 @@ if (!$SkipPackage) {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'assets\StoreLogo.png'), (Join-Path $projectRoot 'assets\Logo150.png'), (Join-Path $projectRoot 'assets\Logo44.png') -Destination $assetsDir -Force
     & (Join-Path $sdkBin 'makeappx.exe') pack /d $packageDir /p (Join-Path $distDir 'Glyph.msix') /o
     if ($LASTEXITCODE -ne 0) { throw 'MSIX packaging failed.' }
+    $resolvedStage = (Resolve-Path -LiteralPath $packageDir).Path
+    if ([System.IO.Path]::GetDirectoryName($resolvedStage) -ne [System.IO.Path]::GetFullPath($buildDir)) { throw 'Package staging path is outside the build directory.' }
+    Remove-Item -LiteralPath $resolvedStage -Recurse -Force
 }
 Write-Host "Built: $distDir\Glyph.exe"
 if (!$SkipPackage) { Write-Host "Package: $distDir\Glyph.msix (unsigned; install.ps1 signs a local copy)" }

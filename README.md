@@ -15,11 +15,14 @@ Glyph is a small native C++20 tray app powered by Windows' offline OCR. It has n
 ## Features
 
 - Draw a box to recognize and automatically select its text; activation does not start OCR.
+- See a solid, high-contrast capture boundary that stays visible after recognition, with the selected region at its original brightness.
+- Use a compact toolbar that hides while you draw, moves away from your selection, and can be dragged out of the way.
 - Refine recognized text by selecting individual characters, words, or multiple lines.
 - Add separate selections and copy them together.
 - Preserve the screen's original fonts and text, with connected translucent selection highlights.
 - Capture multiple monitors, including mixed DPI and negative monitor coordinates.
 - Configure the activation shortcut and OCR language from the tray menu.
+- Retry a box, clear a selection, queue copying while OCR finishes, or copy multiline text as one line.
 - Enable start at login if you want it; it is off by default.
 - Stay idle without polling, timers, or repeated screen capture.
 
@@ -67,13 +70,24 @@ Quit Glyph before uninstalling. Use Windows Settings or `uninstall.ps1`. Optiona
 | Select all recognized text | Ctrl+A |
 | Copy and keep OCR mode open | Ctrl+C or Copy button |
 | Copy and exit | Enter |
-| Exit without copying | Esc, close button, or activation shortcut again |
+| Copy as one line | Ctrl+Shift+C or right-click menu |
+| Retry the last box | R or right-click menu |
+| Clear text and draw again | Backspace or right-click menu |
+| Cancel an unfinished box drag and keep the previous selection | Esc during the drag |
+| Move the toolbar | Drag its title or background |
+| Focus toolbar actions | Tab / Shift+Tab; Enter or Space activates |
+| Show all shortcuts | F1 or right-click menu |
+| Exit without copying | Esc, close button, Alt+F4, or activation shortcut again |
+
+Copy commands pressed during recognition run when the result is ready. An unsuccessful recognition cancels the queued command. Tiny accidental clicks and cancelled box drags preserve the previous selection. Switching to another app closes the frozen-screen overlay.
 
 Click the tray icon to capture. Its context menu offers OCR language, settings, reload settings, start at login, help, and quit. Launching a second copy activates the existing instance. `Glyph.exe --capture` opens directly in OCR mode.
 
 ## Settings
 
-Open **Settings** from the tray, edit `%APPDATA%\Glyph\settings.ini`, save, and select **Reload settings**.
+Open **Settings** from the tray to change the activation shortcut, choose an installed OCR language, or enable start at login. Save applies changes immediately. Invalid or unavailable shortcuts show an error in the window and keep your current shortcut.
+
+Advanced configuration is still available in `%APPDATA%\Glyph\settings.ini`; after editing it, select **Reload settings** from the tray.
 
 ```ini
 [Glyph]
@@ -114,6 +128,10 @@ From PowerShell in the repository root:
 .\build.ps1
 # Executable only:
 .\build.ps1 -SkipPackage
+# Build separately while an existing Glyph.exe is running:
+.\build.ps1 -OutputDirectory dist/ux-preview
+# Run interaction and offscreen rendering checks:
+.\tests\ux-smoke.ps1
 ```
 
 Output goes to `dist\Glyph.exe` and `dist\Glyph.msix`, with installation scripts and documentation. Compiler intermediates go to `build\`. Both generated directories are excluded from Git.
@@ -122,6 +140,8 @@ Output goes to `dist\Glyph.exe` and `dist\Glyph.msix`, with installation scripts
 |---|---|
 | `src/main.cpp` | Tray app, capture, OCR worker, selection, and rendering |
 | `src/app.rc`, `src/app.manifest` | Executable icon, version, and Windows manifest |
+| `src/resource.h` | Native settings control identifiers |
+| `tests/ux_smoke.cpp`, `tests/ux-smoke.ps1` | Interaction state, capture redraw, settings layout, and DPI rendering checks |
 | `assets/` | Vector icon source and Windows icon/package assets |
 | `packaging/AppxManifest.xml` | MSIX identity and capabilities |
 | `build.ps1` | Native release build and MSIX packaging |
