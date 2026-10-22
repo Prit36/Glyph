@@ -163,7 +163,43 @@ public:
             if (IntersectRect(&clipped, &first->bounds, &damage)) drawRow(*first, damage, words, selection, draw);
         }
     }
+    int hit(POINT p, bool nearest, const std::vector<Word>& words) const {
+        int best = -1; double bestDistance = 1e30;
+        auto distance = [p](RECT r) {
+            LONG dx = std::max({r.left - p.x, 0L, p.x - r.right}), dy = std::max({r.top - p.y, 0L, p.y - r.bottom});
+            return static_cast<double>(dx) * dx + static_cast<double>(dy) * dy * 4;
+        };
+        auto visit = [&](const Row& row) {
+            if ((!nearest && !insideBounds(row.bounds, p)) || distance(row.bounds) > bestDistance) return;
+            for (size_t i = row.first; i < row.end; ++i) {
+                const auto& r = words[i].rect;
+                if (!nearest && !insideBounds(r, p)) continue;
+                double d = distance(r);
+                if (d < bestDistance || (d == bestDistance && static_cast<int>(i) < best)) {
+                    bestDistance = d; best = static_cast<int>(i);
+                }
+            }
+        };
+        auto split = std::upper_bound(rows.begin(), rows.end(), p.y,
+            [](LONG y, const Row& row) { return y < row.bounds.top; });
+        // Start at the pointer's row, rather than walking from the first row
+        // and repeatedly finding closer words. Prefix bottoms retain correctness
+        // for tall lines and overlapping Ctrl-added boxes; ties keep text order.
+        for (auto row = split; row != rows.begin();) {
+            --row;
+            double dy = static_cast<double>(std::max(0L, p.y - row->maxBottom));
+            if (dy * dy * 4 > bestDistance) break;
+            visit(*row);
+        }
+        for (auto row = split; row != rows.end(); ++row) {
+            double dy = static_cast<double>(row->bounds.top - p.y);
+            if (dy * dy * 4 > bestDistance) break;
+            visit(*row);
+        }
+        return best;
+    }
 private:
+    static bool insideBounds(RECT r, POINT p) { return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom; }
     template<typename Draw>
     static void drawRow(const Row& row, RECT damage, const std::vector<Word>& words, const std::vector<Span>& selection, Draw draw) {
         RECT strip{}; bool haveStrip = false; size_t previousIndex = 0;
@@ -215,16 +251,40 @@ std::array<RECT,4> outlineRects(RECT r, int halo = 4) {
         RECT{r.left,r.top,r.left + halo * 2,r.bottom}, RECT{r.right - halo * 2,r.top,r.right,r.bottom}};
 }
 
-HRGN boxDamage(RECT before, RECT after, int halo = 4) {
-    HRGN damage = CreateRectRgnIndirect(&before), part = CreateRectRgnIndirect(&after);
-    bool ok = damage && part && CombineRgn(damage, damage, part, RGN_XOR) != ERROR;
-    for (RECT box : {before, after}) for (RECT edge : outlineRects(box, halo)) {
-        if (ok) ok = SetRectRgn(part, edge.left, edge.top, edge.right, edge.bottom) && CombineRgn(damage, damage, part, RGN_OR) != ERROR;
+struct Region {
+    HRGN handle{};
+    ~Region() { if (handle) DeleteObject(handle); }
+    Region() = default;
+    Region(const Region&) = delete;
+    Region& operator=(const Region&) = delete;
+    HRGN get() { if (!handle) handle = CreateRectRgn(0, 0, 0, 0); return handle; }
+    void clear() { if (handle) DeleteObject(handle); handle = nullptr; }
+};
+class BoxDamage {
+    Region damage, from, to;
+public:
+    void clear() { damage.clear(); from.clear(); to.clear(); }
+    HRGN between(RECT before, RECT after, int unit = 1) {
+        if (!damage.get() || !from.get() || !to.get()) return nullptr;
+        if (!SetRectRgn(damage.handle, before.left, before.top, before.right, before.bottom) ||
+            !SetRectRgn(to.handle, after.left, after.top, after.right, after.bottom) ||
+            CombineRgn(damage.handle, damage.handle, to.handle, RGN_XOR) == ERROR) return nullptr;
+        // Sweep only edges whose coordinates moved. Unchanged edges need no
+        // repaint; their changing endpoints are covered by perpendicular sweeps.
+        // Keep each sweep solid: pixel-exact nested XORs fragment into many thin
+        // strips, whose extra GDI flushes cost more than this small overdraw.
+        auto oldEdges = outlineRects(before, unit * 3), newEdges = outlineRects(after, unit * 3);
+        std::array<bool, 4> moved{before.top != after.top, before.bottom != after.bottom,
+            before.left != after.left, before.right != after.right};
+        for (size_t i = 0; i < moved.size(); ++i) {
+            if (!moved[i] && !IsRectEmpty(&before) && !IsRectEmpty(&after)) continue;
+            RECT sweep{}; UnionRect(&sweep, &oldEdges[i], &newEdges[i]);
+            if (!SetRectRgn(from.handle, sweep.left, sweep.top, sweep.right, sweep.bottom) ||
+                CombineRgn(damage.handle, damage.handle, from.handle, RGN_OR) == ERROR) return nullptr;
+        }
+        return damage.handle;
     }
-    if (part) DeleteObject(part);
-    if (!ok && damage) { DeleteObject(damage); damage = nullptr; }
-    return damage;
-}
+};
 
 std::shared_ptr<Frame> capture() {
     auto frame = std::make_shared<Frame>();
@@ -820,6 +880,13 @@ void appendVisualRows(std::vector<Word>& words, std::vector<Word>& output, int& 
 // the existing canvas, avoiding full-screen GDI fills and AlphaBlend surfaces.
 // Original screenshot pixels stay immutable for OCR and crisp selected text.
 void blendRect(Bitmap& destination, const Bitmap& source, RECT rect, uint32_t color, int alpha, POINT origin = {}) {
+    if (!alpha) {
+        auto from = static_cast<const uint32_t*>(source.pixels); auto to = static_cast<uint32_t*>(destination.pixels);
+        for (LONG y = rect.top; y < rect.bottom; ++y)
+            memcpy(to + static_cast<size_t>(y - origin.y) * destination.width + rect.left - origin.x,
+                from + static_cast<size_t>(y) * source.width + rect.left, static_cast<size_t>(rect.right - rect.left) * 4);
+        return;
+    }
     __m128i zero = _mm_setzero_si128(), ones = _mm_set1_epi16(1);
     __m128i weight = _mm_set1_epi16(static_cast<short>(255 - alpha));
     __m128i colors = _mm_unpacklo_epi8(_mm_set1_epi32(static_cast<int>(color)), zero);
@@ -937,19 +1004,27 @@ public:
     std::shared_ptr<Frame> frame;
     std::vector<Word> words;
     std::vector<WordRow> wordRows;
-    std::vector<Span> selection, baseSelection, nextSelection;
+    std::vector<Span> selection, baseSelection;
     FontCache fonts;
     HighlightRows highlights;
     std::vector<std::pair<std::wstring, std::wstring>> languages;
     std::unique_ptr<Bitmap> canvas;
     HDC renderDc{};
     HGDIOBJ previousCanvas{};
+    std::unique_ptr<Bitmap> hudCanvas;
+    HDC hudDc{};
+    HGDIOBJ previousHudCanvas{};
+    std::array<int, 6> hudStyle{};
+    double hudStyleScale{};
+    BoxDamage boxDamage;
+    Region paintRegion;
     HICON icon{};
     bool active{}, recognizing{}, dragging{}, boxMode{}, addRegion{}, quitting{};
-    bool hotkeyRegistered{}, movingHud{}, addNext{}, copied{};
+    bool hotkeyRegistered{}, movingHud{}, addNext{}, copied{}, trackingMouse{};
     int hovered{}, pressed{}, focused{}, pendingCopy{};
     uint64_t session{};
     int anchorWord{-1}, anchorCharacter{}, elapsed{};
+    std::pair<int, int> textEnd{-1, 0};
     double uiScale{1.0};
     POINT dragOrigin{}, hudOffset{};
     RECT hud{}, copyButton{}, closeButton{}, selectionBox{}, previousBox{};
@@ -963,12 +1038,14 @@ public:
     void releaseCanvas() {
         if (renderDc) { SelectObject(renderDc, previousCanvas); DeleteDC(renderDc); renderDc = nullptr; }
         canvas.reset();
+        if (hudDc) { SelectObject(hudDc, previousHudCanvas); DeleteDC(hudDc); hudDc = nullptr; }
+        hudCanvas.reset(); hudStyleScale = 0;
     }
     void allocateCanvas() {
         releaseCanvas();
-        // A bounded strip buffer replaces the second desktop-sized bitmap.
+        // A bounded tile buffer replaces the second desktop-sized bitmap.
         // Painting uses global logical coordinates with a translated viewport.
-        canvas = std::make_unique<Bitmap>(std::min(frame->image->width,4096),std::min(frame->image->height,256));
+        canvas = std::make_unique<Bitmap>(std::min(frame->image->width,512),std::min(frame->image->height,512));
         renderDc = CreateCompatibleDC(nullptr);
         if (!renderDc) throw std::runtime_error("Cannot create overlay render device");
         previousCanvas = SelectObject(renderDc,canvas->handle);
@@ -989,8 +1066,9 @@ public:
         // Only the area that changed between the clear box and dimmed desktop
         // needs repainting. Retain separate strips instead of a desktop-sized union.
         if (!active) return;
-        HRGN damage = boxDamage(before, after, std::max(4, ui(4)));
-        if (damage) { InvalidateRgn(window, damage, FALSE); DeleteObject(damage); }
+        if (EqualRect(&before, &after)) return;
+        HRGN damage = boxDamage.between(before, after, std::max(1, ui(1)));
+        if (damage) InvalidateRgn(window, damage, FALSE);
         else invalidate();
     }
     size_t selectedWords() const {
@@ -1191,7 +1269,7 @@ public:
             allocateCanvas();
         }
         catch (const std::exception& e) { frame.reset(); releaseCanvas(); notify(widen(e), true); return; }
-        words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear(); detectedLanguage.clear();
+        words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); detectedLanguage.clear();
         highlights.clear();
         status = L"Drag a box around the text you need.";
         active = true; recognizing = false; dragging = false; boxMode = true; anchorWord = -1; elapsed = 0;
@@ -1209,9 +1287,14 @@ public:
         if (!active) return;
         bool restoreFocus = GetForegroundWindow() == window;
         worker->cancel(); active = false; recognizing = false; dragging = false; ReleaseCapture(); ShowWindow(window, SW_HIDE);
+        if (trackingMouse) {
+            TRACKMOUSEEVENT tracking{sizeof(tracking), TME_CANCEL | TME_LEAVE, window, 0};
+            TrackMouseEvent(&tracking); trackingMouse = false;
+        }
         SetWindowLongPtr(window, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
         std::vector<Word>().swap(words); std::vector<WordRow>().swap(wordRows);
-        std::vector<Span>().swap(selection); std::vector<Span>().swap(baseSelection); std::vector<Span>().swap(nextSelection);
+        std::vector<Span>().swap(selection); std::vector<Span>().swap(baseSelection);
+        boxDamage.clear(); paintRegion.clear();
         fonts.clear(); highlights.clear(); frame.reset(); releaseCanvas();
         if (restoreFocus && IsWindow(previousWindow)) SetForegroundWindow(previousWindow);
     }
@@ -1274,9 +1357,8 @@ public:
             }
             wordRows.push_back({first, end, bounds}); first = end;
         }
-        selection.resize(words.size()); baseSelection.resize(words.size());
+        selection.resize(words.size());
         for (size_t i = existing; i < words.size(); ++i) selection[i] = {0, length(words[i])};
-        baseSelection = selection;
         highlights.changed();
         elapsed = r.elapsed; detectedLanguage = r.language; recognizing = !r.complete;
         lastError = r.error;
@@ -1289,24 +1371,16 @@ public:
         }
         invalidate();
     }
-    std::pair<int, int> hit(POINT p, bool nearest) const {
-        int best = -1; double bestDistance = 1e30;
-        auto distance = [](RECT r, POINT p) {
-            LONG dx = std::max({r.left - p.x, 0L, p.x - r.right}), dy = std::max({r.top - p.y, 0L, p.y - r.bottom});
-            return static_cast<double>(dx) * dx + static_cast<double>(dy) * dy * 4;
-        };
-        for (const auto& row : wordRows) {
-            if ((!nearest && !inside(row.bounds, p)) || distance(row.bounds, p) >= bestDistance) continue;
-            for (int i = static_cast<int>(row.first); i < static_cast<int>(row.end); ++i) {
-                const auto& r = words[i].rect;
-                if (!nearest && !inside(r, p)) continue;
-                double d = distance(r, p);
-                if (d < bestDistance) { bestDistance = d; best = i; if (!d) break; }
-            }
-        }
+    std::pair<int, int> hit(POINT p, bool nearest) {
+        highlights.prepare(words, wordRows);
+        int best = highlights.hit(p, nearest, words);
         if (best < 0) return {-1, 0};
-        const auto& w = words[best]; int c = 0;
-        for (int i = 0; i < length(w); ++i) { if (p.x >= (w.edges[i] + w.edges[i + 1]) / 2) c = i + 1; }
+        const auto& w = words[best]; int c = 0, end = length(w);
+        while (c < end) {
+            int mid = c + (end - c) / 2;
+            if (p.x >= (w.edges[mid] + w.edges[mid + 1]) / 2) c = mid + 1;
+            else end = mid;
+        }
         if (c > 0 && c < length(w) && low(w.text[c]) && high(w.text[c - 1])) ++c;
         return {best, c};
     }
@@ -1333,6 +1407,7 @@ public:
         auto [index, character] = hit(p, true);
         if (index < 0) { invalidate(); return; }
         anchorWord = index; anchorCharacter = character; dragging = true; SetCapture(window);
+        textEnd = {index, character};
         invalidate();
     }
     void mouseDown(POINT p, bool doubleClick) {
@@ -1361,18 +1436,25 @@ public:
     void mouseMove(POINT p) {
         int over = controlAt(p);
         if (over != hovered) { hovered = over; invalidate(hud); }
-        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0}; TrackMouseEvent(&tracking);
+        if (!trackingMouse) {
+            TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+            trackingMouse = TrackMouseEvent(&tracking) != FALSE;
+        }
         if (movingHud) {
             RECT old = hud, work = monitorWork(p);
             LONG oldWidth = hud.right - hud.left, oldHeight = hud.bottom - hud.top;
             double scale = monitorScale(p);
-            if (scale != uiScale) invalidateOutline(selectionBox);
+            bool scaleChanged = scale != uiScale;
+            if (scaleChanged) invalidateOutline(selectionBox);
             uiScale = scale;
             LONG w = std::min(static_cast<LONG>(ui(380)), work.right - work.left - ui(24)), h = ui(46);
             hudOffset = {MulDiv(hudOffset.x, w, std::max(1L, oldWidth)), MulDiv(hudOffset.y, h, std::max(1L, oldHeight))};
             LONG x = std::clamp(p.x - hudOffset.x, work.left, std::max(work.left, work.right - w));
             LONG y = std::clamp(p.y - hudOffset.y, work.top, std::max(work.top, work.bottom - h));
-            hud = {x, y, x + w, y + h}; layoutButtons(); invalidateOutline(selectionBox); invalidate(old); invalidate(hud); return;
+            hud = {x, y, x + w, y + h};
+            if (scaleChanged) invalidateOutline(selectionBox);
+            if (!EqualRect(&old, &hud)) { layoutButtons(); invalidate(old); invalidate(hud); }
+            return;
         }
         if (!dragging) return;
         if (boxMode) {
@@ -1381,23 +1463,33 @@ public:
             if (EqualRect(&old,&selectionBox)) return;
             invalidateBoxChange(old, selectionBox); return;
         }
-        nextSelection = baseSelection;
+        updateTextSelection(p);
+    }
+    void updateTextSelection(POINT p) {
         auto [index, character] = hit(p, true); if (index < 0) return;
+        auto endpoint = std::pair{index, character};
+        if (endpoint == textEnd) return;
         auto start = std::pair{anchorWord, anchorCharacter}, end = std::pair{index, character};
         if (start > end) std::swap(start, end);
-        for (int i = start.first; i <= end.first; ++i) {
-            Span range{i == start.first ? start.second : 0, i == end.first ? end.second : length(words[i])};
-            if (range.begin >= range.end) continue;
-            if (nextSelection[i].begin < nextSelection[i].end) range = {std::min(nextSelection[i].begin, range.begin), std::max(nextSelection[i].end, range.end)};
-            nextSelection[i] = range;
-        }
-        bool changed = false;
+        bool changed = false, countChanged = false;
         // Coalesce consecutive changes on one highlight band, retaining separate
         // rows in the Windows update region instead of one desktop-sized union.
         RECT dirty{};
         auto flush = [&] { if (!IsRectEmpty(&dirty)) invalidate(dirty); dirty = {}; };
-        for (size_t i = 0; i < words.size(); ++i) {
-            if (selection[i].begin == nextSelection[i].begin && selection[i].end == nextSelection[i].end) continue;
+        // Moving one endpoint only changes the words between its old and new
+        // positions, including reversals across the anchor. Restore those from
+        // the gesture's base, then apply the new range in place.
+        for (int i = std::min(textEnd.first, index); i <= std::max(textEnd.first, index); ++i) {
+            Span next = baseSelection[i];
+            if (i >= start.first && i <= end.first) {
+                Span range{i == start.first ? start.second : 0, i == end.first ? end.second : length(words[i])};
+                if (range.begin < range.end) next = next.begin < next.end ?
+                    Span{std::min(next.begin, range.begin), std::max(next.end, range.end)} : range;
+            }
+            auto old = selection[i];
+            if (old.begin == next.begin && old.end == next.end) continue;
+            countChanged |= (old.begin < old.end) != (next.begin < next.end);
+            selection[i] = next;
             RECT area = words[i].highlightBand;
             // Include the neighboring space so connected highlights are restored
             // correctly when shrinking or reversing a selection.
@@ -1407,8 +1499,8 @@ public:
             if (IsRectEmpty(&dirty)) dirty = area; else UnionRect(&dirty, &dirty, &area);
             changed = true;
         }
-        selection.swap(nextSelection);
-        if (changed) { flush(); copied = false; invalidate(hud); }
+        textEnd = endpoint;
+        if (changed) { flush(); if (countChanged || copied) invalidate(hud); copied = false; }
     }
     void mouseUp(POINT p) {
         if (movingHud) { movingHud = false; ReleaseCapture(); return; }
@@ -1430,12 +1522,13 @@ public:
         dragging = false;
         if (!boxMode) { status = L"Ctrl+C to copy  \x00b7  Enter to copy and close"; invalidate(hud); return; }
         if (!recognize || selectionBox.right - selectionBox.left < 3 || selectionBox.bottom - selectionBox.top < 3) {
+            RECT old = selectionBox;
             selectionBox = previousBox;
             status = words.empty() ? L"Drag a box around the text you need." : L"Selection kept. Ctrl+C to copy or draw another box.";
-            invalidate(); return;
+            invalidateBoxChange(old, selectionBox); invalidate(hud); return;
         }
         if (!addRegion) {
-            words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear();
+            words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear();
             fonts.clear(); highlights.clear(); detectedLanguage.clear();
         }
         recognizing = true; copied = false; lastError.clear(); elapsed = 0;
@@ -1513,6 +1606,8 @@ public:
         static DrawingRuntime runtime;
         using namespace Gdiplus;
         int margin = 0, width = hud.right - hud.left, height = hud.bottom - hud.top;
+        auto count = selectedWords();
+        bool enabled = !recognizing && count != 0;
         // Center the icon and measured label as one unit, at device-pixel bounds.
         SIZE copyExtent{};
         auto oldFont = SelectObject(destination, fonts.get(ui(14), FW_MEDIUM));
@@ -1521,10 +1616,20 @@ public:
         int groupWidth = ui(14) + ui(7) + copyExtent.cx;
         int iconLeft = copyButton.left + (copyButton.right - copyButton.left - groupWidth) / 2;
         int iconTop = copyButton.top + (copyButton.bottom - copyButton.top - ui(14)) / 2;
-        ::Bitmap surface(width + margin * 2, height + margin * 2);
-        memset(surface.pixels, 0, static_cast<size_t>(surface.width) * surface.height * 4);
-        Gdiplus::Bitmap image(surface.width, surface.height, surface.width * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(surface.pixels));
-        {
+        // Retain only the small alpha shapes. Text stays on the opaque target
+        // for ClearType; moving or partially repainting the HUD reuses its shapes.
+        std::array<int, 6> style{width, height, pressed, hovered, focused, enabled};
+        if (!hudCanvas || !hudDc || hudCanvas->width != width || hudCanvas->height != height) {
+            if (hudDc) { SelectObject(hudDc, previousHudCanvas); DeleteDC(hudDc); hudDc = nullptr; }
+            hudCanvas = std::make_unique<::Bitmap>(width, height);
+            hudDc = CreateCompatibleDC(destination);
+            if (!hudDc) throw std::runtime_error("Cannot create toolbar render device");
+            previousHudCanvas = SelectObject(hudDc, hudCanvas->handle); hudStyleScale = 0;
+        }
+        if (style != hudStyle || uiScale != hudStyleScale) {
+            GdiFlush();
+            memset(hudCanvas->pixels, 0, static_cast<size_t>(width) * height * 4);
+            Gdiplus::Bitmap image(width, height, width * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(hudCanvas->pixels));
             Graphics g(&image); g.SetSmoothingMode(SmoothingModeAntiAlias); g.SetPixelOffsetMode(PixelOffsetModeHalf);
             auto rounded = [&](RectF rect, float radius, Brush& brush, Pen* pen = nullptr) {
                 GraphicsPath path; float d = radius * 2;
@@ -1537,7 +1642,6 @@ public:
             SolidBrush panelFill(Color(255, 29, 30, 33));
             Pen border(Color(255, 43, 44, 48), static_cast<float>(uiScale));
             rounded(panel, static_cast<float>(ui(10)), panelFill, &border);
-            bool enabled = canCopy();
             RectF button(m+copyButton.left-hud.left, m+copyButton.top-hud.top, static_cast<float>(copyButton.right-copyButton.left), static_cast<float>(copyButton.bottom-copyButton.top));
             Color buttonColor = enabled ? (pressed == 1 ? Color(255,220,220,223) : hovered == 1 ? Color(255,255,255,255) : Color(255,244,244,245)) : Color(255,48,50,54);
             SolidBrush buttonFill(buttonColor); Pen focus(Color(255,160,189,218), static_cast<float>(std::max(1, ui(1))));
@@ -1552,15 +1656,14 @@ public:
             Pen cross(Color(255,176,180,190), static_cast<float>(uiScale*1.4)); cross.SetStartCap(LineCapRound); cross.SetEndCap(LineCapRound);
             float cx = close.X+close.Width/2, cy = close.Y+close.Height/2, arm = static_cast<float>(ui(5));
             g.DrawLine(&cross,cx-arm,cy-arm,cx+arm,cy+arm); g.DrawLine(&cross,cx+arm,cy-arm,cx-arm,cy+arm);
+            hudStyle = style; hudStyleScale = uiScale;
         }
-        HDC source = CreateCompatibleDC(destination); auto previous = SelectObject(source, surface.handle);
         BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-        AlphaBlend(destination, hud.left-margin, hud.top-margin, surface.width, surface.height, source, 0, 0, surface.width, surface.height, blend);
-        SelectObject(source, previous); DeleteDC(source);
+        AlphaBlend(destination, hud.left-margin, hud.top-margin, width, height, hudDc, 0, 0, width, height, blend);
         // Small orthogonal icon edges must land on whole device pixels. Draw
         // these directly, without fractional GDI+ strokes or alpha filtering.
-        COLORREF iconInk = canCopy() ? RGB(32, 35, 41) : RGB(122, 125, 134);
-        COLORREF iconBackground = !canCopy() ? RGB(48, 50, 54) : pressed == 1 ? RGB(220, 220, 223) :
+        COLORREF iconInk = enabled ? RGB(32, 35, 41) : RGB(122, 125, 134);
+        COLORREF iconBackground = !enabled ? RGB(48, 50, 54) : pressed == 1 ? RGB(220, 220, 223) :
             hovered == 1 ? RGB(255, 255, 255) : RGB(244, 244, 245);
         HPEN iconPen = CreatePen(PS_SOLID, std::max(1, ui(1)), iconInk);
         auto previousPen = SelectObject(destination, iconPen);
@@ -1574,7 +1677,6 @@ public:
         // Draw labels last, on the opaque final canvas. Native ClearType keeps
         // small glyphs sharp; drawing onto a transparent alpha surface cannot
         // preserve the same subpixel coverage.
-        auto count = selectedWords();
         std::wstring heading = recognizing ? (pendingCopy ? L"Reading, then copying..." : L"Reading text...") :
             copied ? L"Copied to clipboard" : addNext ? L"Select more text" : !lastError.empty() ? L"Couldn't read text" :
             count ? std::to_wstring(count) + (count == 1 ? L" word selected" : L" words selected") :
@@ -1592,18 +1694,17 @@ public:
             hudText(destination, count == 1 ? L" word selected" : L" words selected", title, ui(14), RGB(188, 192, 202));
         } else hudText(destination, heading, title, ui(14), RGB(225, 227, 233));
         RECT label{iconLeft + ui(14) + ui(7), copyButton.top, copyButton.right - ui(6), copyButton.bottom};
-        hudText(destination, L"Copy", label, ui(14), canCopy() ? RGB(25, 28, 33) : RGB(157, 161, 170), textFlags, FW_MEDIUM);
+        hudText(destination, L"Copy", label, ui(14), enabled ? RGB(25, 28, 33) : RGB(157, 161, 170), textFlags, FW_MEDIUM);
     }
     void paint() {
         // Preserve complex update regions: using only rcPaint would repaint the
         // whole box interior even when just its thin outline changed.
         constexpr DWORD maxRectangles = 256;
-        alignas(RGNDATA) std::array<BYTE,sizeof(RGNDATAHEADER) + maxRectangles * sizeof(RECT)> storage{};
+        alignas(RGNDATA) std::array<BYTE,sizeof(RGNDATAHEADER) + maxRectangles * sizeof(RECT)> storage;
         auto data = reinterpret_cast<RGNDATA*>(storage.data());
-        HRGN update = CreateRectRgn(0,0,0,0); DWORD bytes = 0;
+        HRGN update = paintRegion.get(); DWORD bytes = 0;
         if (update && GetUpdateRgn(window,update,FALSE) == COMPLEXREGION)
             bytes = GetRegionData(update,static_cast<DWORD>(storage.size()),data);
-        if (update) DeleteObject(update);
         PAINTSTRUCT ps{}; HDC screen = BeginPaint(window, &ps);
         if (!active || !frame || !canvas) { EndPaint(window, &ps); return; }
         if (bytes && bytes <= storage.size() && data->rdh.nCount <= maxRectangles) {
@@ -1624,9 +1725,18 @@ public:
         HDC dc = renderDc;
         POINT origin{damage.left,damage.top};
         // Finish previous GDI writes before accessing the DIB pixels directly.
-        GdiFlush(); blendRect(*canvas, *frame->image, damage, 0x00080e16, 62,origin);
+        GdiFlush();
         RECT clear{};
-        if (IntersectRect(&clear, &selectionBox, &damage)) blendRect(*canvas, *frame->image, clear, 0, 0, origin);
+        if (IntersectRect(&clear, &selectionBox, &damage)) {
+            // Copy the clear interior once. Only dim the four disjoint pieces
+            // around it; large boxes used to blend their entire interior twice.
+            blendRect(*canvas, *frame->image, clear, 0, 0, origin);
+            for (RECT part : {RECT{damage.left, damage.top, damage.right, clear.top},
+                RECT{damage.left, clear.bottom, damage.right, damage.bottom},
+                RECT{damage.left, clear.top, clear.left, clear.bottom},
+                RECT{clear.right, clear.top, damage.right, clear.bottom}})
+                if (!IsRectEmpty(&part)) blendRect(*canvas, *frame->image, part, 0x00080e16, 62, origin);
+        } else blendRect(*canvas, *frame->image, damage, 0x00080e16, 62, origin);
         SelectClipRgn(dc,nullptr); SetViewportOrgEx(dc,-damage.left,-damage.top,nullptr);
         IntersectClipRect(dc, damage.left, damage.top, damage.right, damage.bottom);
         // The row index survives character-selection changes. Only words on
@@ -1658,7 +1768,7 @@ public:
     void clearSelection() {
         cancelRecognition();
         dragging = movingHud = false; pressed = focused = 0; ReleaseCapture();
-        words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear(); nextSelection.clear();
+        words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear();
         fonts.clear(); highlights.clear(); selectionBox = {}; previousBox = {};
         copied = false; addNext = false; lastError.clear(); detectedLanguage.clear();
         status = L"Selection cleared. Drag a new box around text."; invalidate();
@@ -1798,7 +1908,7 @@ public:
         case WM_LBUTTONUP: mouseUp({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}); return 0;
         case WM_CAPTURECHANGED: movingHud = false; pressed = 0; finishDrag(); invalidate(hud); return 0;
         case WM_CANCELMODE: movingHud = false; pressed = 0; finishDrag(); ReleaseCapture(); return 0;
-        case WM_MOUSELEAVE: hovered = 0; invalidate(hud); return 0;
+        case WM_MOUSELEAVE: trackingMouse = false; if (hovered) { hovered = 0; invalidate(hud); } return 0;
         case WM_CONTEXTMENU: captureMenu(); return 0;
         case WM_SETCURSOR:
             if (active && LOWORD(lp) == HTCLIENT) {

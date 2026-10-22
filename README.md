@@ -107,9 +107,9 @@ The tray app blocks on Windows messages, and its worker sleeps while idle. The O
 
 Recognition runs on a worker thread using grayscale OCR input. Native-resolution and 2× passes are followed by smaller 3×/4× recovery crops with contrast stretching and automatic dark-background inversion. A final thresholded 4× pass only fills remaining gaps. All passes use overlapping tiles within Windows' image-size limit and a 5-megapixel input budget per tile; uniform tiles are skipped. Readings that agree across different scales take priority, with native text favored on ties for normal-size words and stronger enlargement favored for tiny words. Threshold recovery cannot overwrite other readings. Word boxes are scaled and rotated back to the original screen for merging and selection.
 
-Tile passes are parallelized across a bounded thread pool (2–4 worker threads) with recyclable OcrEngine instances, reducing recognition latency by >3× while preserving all multi-scale recovery accuracy. Region recognition reuses a job-local grayscale buffer capped at 16 MiB. Candidate matching uses a spatial index on both axes. Box dragging repaints changed outlines; text dragging preserves separate row damage regions. Painting indexes highlight rows so small updates visit nearby words. Clipboard status changes repaint only the HUD. The font cache holds at most 64 exact sizes. Text measurements are reused within each incoming result, capped at 256 entries and a 64 KiB budget for used key/advance bytes (allocation overhead is additional), then released; selection retains only its character boundaries.
+Tile passes are parallelized across a bounded thread pool (2–4 worker threads) with recyclable OcrEngine instances, reducing recognition latency by >3× while preserving all multi-scale recovery accuracy. Region recognition reuses a job-local grayscale buffer capped at 16 MiB. Candidate matching uses a spatial index on both axes. Box dragging repaints only the changed interior and moving edges, reusing damage regions. Text dragging updates only words between the previous and current endpoints, retaining separate row damage regions and one gesture snapshot. The highlight-row index also finds nearby words for hit testing, including overlapping added boxes. Clear box interiors copy directly from the screenshot without blending. Clipboard status changes repaint only the HUD, whose small alpha shapes are reused between visual state changes. The font cache holds at most 64 exact sizes. Text measurements are reused within each incoming result, capped at 256 entries and a 64 KiB budget for used key/advance bytes (allocation overhead is additional), then released; selection retains only its character boundaries.
 
-The executable uses a statically linked C++ runtime. Runtime memory depends on display resolution: the screenshot and bounded rendering buffer alone use about **35.4 MiB for one 4K desktop**. The scratch rendering buffer is capped at 4 MiB, and large selection containers and the highlight-row index are released on exit. OCR and other app allocations are additional.
+The executable uses a statically linked C++ runtime. Runtime memory depends on display resolution: the screenshot and bounded rendering buffer alone use about **32.6 MiB for one 4K desktop**. The scratch rendering buffer is capped at 1 MiB (512 × 512 pixels); the reusable toolbar alpha surface adds about 68 KiB at 100% DPI or 273 KiB at 200%. Rendering surfaces, damage regions, large selection containers, and the highlight-row index are released on exit. OCR and other app allocations are additional. See the [drag benchmark results](docs/benchmarks/drag-2026-10-22.md) for measured changes and test conditions.
 
 ## Limitations
 
@@ -132,6 +132,8 @@ From PowerShell in the repository root:
 .\build.ps1 -OutputDirectory dist/ux-preview
 # Run interaction and offscreen rendering checks:
 .\tests\ux-smoke.ps1
+# Run the offscreen 4K box and 20,000-word selection benchmark:
+.\tests\drag-perf.ps1
 ```
 
 Output goes to `dist\Glyph.exe` and `dist\Glyph.msix`, with installation scripts and documentation. Compiler intermediates go to `build\`. Both generated directories are excluded from Git.
@@ -142,6 +144,7 @@ Output goes to `dist\Glyph.exe` and `dist\Glyph.msix`, with installation scripts
 | `src/app.rc`, `src/app.manifest` | Executable icon, version, and Windows manifest |
 | `src/resource.h` | Native settings control identifiers |
 | `tests/ux_smoke.cpp`, `tests/ux-smoke.ps1` | Interaction state, capture redraw, settings layout, and DPI rendering checks |
+| `tests/drag-perf.cpp`, `tests/drag-perf.ps1` | Offscreen box drawing and text selection performance benchmark |
 | `assets/` | Vector icon source and Windows icon/package assets |
 | `packaging/AppxManifest.xml` | MSIX identity and capabilities |
 | `build.ps1` | Native release build and MSIX packaging |
