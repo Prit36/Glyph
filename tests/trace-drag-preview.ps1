@@ -1,12 +1,12 @@
-param([ValidateRange(10, 60)][int]$Seconds = 20)
+param([ValidateRange(10, 60)][int]$Seconds = 20, [string]$PreviewPath = 'dist/flip-preview/Glyph.exe')
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Windows requires Administrator rights for GPU/display tracing. Run this script from an Administrator PowerShell terminal.'
 }
-$preview = Join-Path $projectRoot 'dist/frame-pacing-preview/Glyph.exe'
-if (!(Test-Path -LiteralPath $preview)) { throw 'Build the preview first: ./build.ps1 -SkipPackage -OutputDirectory dist/frame-pacing-preview' }
+$preview = if ([IO.Path]::IsPathRooted($PreviewPath)) { [IO.Path]::GetFullPath($PreviewPath) } else { [IO.Path]::GetFullPath((Join-Path $projectRoot $PreviewPath)) }
+if (!(Test-Path -LiteralPath $preview)) { throw 'Build the preview first: ./build.ps1 -SkipPackage -OutputDirectory dist/flip-preview' }
 $wpr = (Get-Command wpr.exe -ErrorAction Stop).Source
 $state = & $wpr -status 2>&1
 if ($LASTEXITCODE -ne 0 -or ($state -join "`n") -notmatch 'WPR is not recording') {

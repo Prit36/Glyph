@@ -256,6 +256,18 @@ void framePacingRegressions() {
     renderRegion(app, actual, observedDamage);
     app.render(expected.dc, {0, 0, 400, 260}); samePixels(actual, expected, "Cancelling pending drag must restore the original pixels");
     check(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) <= handles + 3, "Frame scheduling must not leak GDI resources");
+    // Sampling the current cursor for a frame must not be undone by an older
+    // WM_MOUSEMOVE coordinate still in the message queue. Do not move the mouse.
+    POINT cursor{}; check(GetCursorPos(&cursor) != FALSE, "Could not read cursor for input-order regression");
+    SetWindowPos(app.window, nullptr, cursor.x - 100, cursor.y - 100, 400, 260, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetCapture(app.window);
+    check(GetCapture() == app.window, "Could not capture test window for input-order regression");
+    app.dragging = app.boxMode = true; app.dragOrigin = {30, 30};
+    app.mouseMove({390, 250});
+    POINT current = app.currentDragPointer({390, 250});
+    RECT sampled = dragRegion(app.dragOrigin, current, 400, 260);
+    check(EqualRect(&sampled, &app.selectionBox), "Queued mouse coordinates must not rewind a sampled box");
+    app.finishDrag(false); ReleaseCapture();
     observedWindow = nullptr; observedDamage = nullptr;
     app.active = false; DestroyWindow(app.window); app.window = nullptr;
 

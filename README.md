@@ -109,9 +109,9 @@ Recognition runs on a worker thread using grayscale OCR input. Native-resolution
 
 Tile passes are parallelized across a bounded thread pool (2–4 worker threads) with recyclable OcrEngine instances, reducing recognition latency by >3× while preserving all multi-scale recovery accuracy. Region recognition reuses a job-local grayscale buffer capped at 16 MiB. Candidate matching uses a spatial index on both axes. Box dragging repaints only the changed interior and moving edges, reusing damage regions. Text dragging updates only words between the previous and current endpoints, retaining separate row damage regions and one gesture snapshot. The highlight-row index also finds nearby words for hit testing, including overlapping added boxes. Clear box interiors copy directly from the screenshot without blending. Clipboard status changes repaint only the HUD, whose small alpha shapes are reused between visual state changes. The font cache holds at most 64 exact sizes. Text measurements are reused within each incoming result, capped at 256 entries and a 64 KiB budget for used key/advance bytes (allocation overhead is additional), then released; selection retains only its character boundaries.
 
-The executable uses a statically linked C++ runtime. Runtime memory depends on display resolution: the screenshot and bounded rendering buffer alone use about **32.6 MiB for one 4K desktop**. The scratch rendering buffer is capped at 1 MiB (512 × 512 pixels); the reusable toolbar alpha surface adds about 68 KiB at 100% DPI or 273 KiB at 200%. Rendering surfaces, damage regions, large selection containers, and the highlight-row index are released on exit. OCR and other app allocations are additional. See the [drag benchmark results](docs/benchmarks/drag-2026-10-22.md) for measured changes and test conditions.
+The executable uses a statically linked C++ runtime. Runtime memory depends on display resolution: the CPU screenshot and bounded rendering buffer alone use about **32.6 MiB for one 4K desktop**. The scratch rendering buffer is capped at 1 MiB (512 × 512 pixels); the reusable toolbar alpha surface adds about 68 KiB at 100% DPI or 273 KiB at 200%. Hardware presentation additionally requests a retained GPU scene and two presentation buffers (about 95 MiB at 4K, plus driver allocations). Rendering surfaces, damage regions, large selection containers, and the highlight-row index are released when capture closes. OCR and other app allocations are additional. See the [drag benchmark results](docs/benchmarks/drag-2026-10-22.md) for measured changes and test conditions.
 
-Box movement is coalesced into refresh-timed submissions, with ready frames prioritized over queued mouse messages and each completed GDI paint explicitly flushed. The one-shot timer is armed only for a changed box and is closed when the gesture ends. See [frame-pacing validation and live tracing](docs/benchmarks/frame-pacing-preview.md) for measured app timings and display-cadence limitations.
+The overlay presents complete frames through a DXGI flip-model swap chain with maximum frame latency set to one. Only changed tiles are rasterized and uploaded; Windows signals when the next frame can start. Ready frames take priority over queued mouse messages and sample the current pointer, including when processing older mouse messages. Stationary overlays wait for messages without rendering or polling. If hardware initialization or presentation fails, the refresh-timed GDI path remains available. See the [presentation investigation and validation](docs/benchmarks/flip-presentation-preview.md) for results, memory costs, and limitations; the [earlier GDI investigation](docs/benchmarks/frame-pacing-preview.md) is retained for comparison.
 
 ## Limitations
 
@@ -138,8 +138,12 @@ From PowerShell in the repository root:
 .\tests\drag-perf.ps1
 # Check frame scheduling under a synthetic mouse-message stream:
 .\tests\frame-pacing.ps1
-# Build separately for frame-pacing profiling:
-.\build.ps1 -SkipPackage -OutputDirectory dist/frame-pacing-preview
+# Check hardware presentation pixels, cancellation, and cleanup:
+.\tests\presented-pacing.ps1
+# Measure a visible generated test scene for five seconds:
+.\tests\presented-pacing.ps1 -Visible
+# Build separately to try the new presentation path:
+.\build.ps1 -SkipPackage -OutputDirectory dist/flip-preview
 ```
 
 Output goes to `dist\Glyph.exe` and `dist\Glyph.msix`, with installation scripts and documentation. Compiler intermediates go to `build\`. Both generated directories are excluded from Git.

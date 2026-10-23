@@ -65,6 +65,8 @@ struct Bitmap {
     Bitmap& operator=(const Bitmap&) = delete;
 };
 
+#include "presentation.h"
+
 struct Frame {
     RECT desktop{};
     std::vector<RECT> monitors;
@@ -360,7 +362,8 @@ private:
 };
 
 class DragTrace {
-    struct Sample { int64_t input{}, begin{}, submit{}, scheduled{}; DWORD messageAge{}; DWORD rectangles{}; uint64_t pixels{}; RECT box{}; POINT pointer{}; };
+    struct Sample { int64_t input{}, begin{}, submit{}, scheduled{}; DWORD messageAge{}; DWORD rectangles{}; uint64_t pixels{}; RECT box{}; POINT pointer{};
+        UINT presentId{}; DXGI_FRAME_STATISTICS displayed{}; };
     std::vector<Sample> samples;
     std::filesystem::path path;
     size_t next{};
@@ -371,9 +374,10 @@ public:
         path = std::filesystem::absolute(std::move(output)); samples.reserve(4096);
         LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); frequency = value.QuadPart;
     }
-    void record(int64_t input, int64_t begin, DWORD age, DWORD rectangles, uint64_t pixels, RECT box, POINT pointer, int64_t scheduled = 0) {
+    void record(int64_t input, int64_t begin, DWORD age, DWORD rectangles, uint64_t pixels, RECT box, POINT pointer, int64_t scheduled = 0,
+        UINT presentId = 0, DXGI_FRAME_STATISTICS displayed = {}) {
         if (!enabled()) return;
-        Sample sample{input, begin, DragFrameClock::now(), scheduled, age, rectangles, pixels, box, pointer};
+        Sample sample{input, begin, DragFrameClock::now(), scheduled, age, rectangles, pixels, box, pointer, presentId, displayed};
         if (samples.size() < 4096) samples.push_back(sample);
         else { samples[next] = sample; next = (next + 1) % samples.size(); }
     }
@@ -381,11 +385,12 @@ public:
         if (!enabled()) return;
         try {
             std::ofstream output(path);
-            output << "qpc_frequency,input_qpc,paint_begin_qpc,submit_qpc,scheduled_qpc,message_age_ms,rectangles,pixels,left,top,right,bottom,pointer_x,pointer_y\n";
+            output << "qpc_frequency,input_qpc,paint_begin_qpc,submit_qpc,scheduled_qpc,message_age_ms,rectangles,pixels,left,top,right,bottom,pointer_x,pointer_y,present_id,displayed_present_id,display_refresh_count,display_sync_qpc\n";
             for (size_t i = 0; i < samples.size(); ++i) {
                 const auto& s = samples[(next + i) % samples.size()];
                 output << frequency << ',' << s.input << ',' << s.begin << ',' << s.submit << ',' << s.scheduled << ',' << s.messageAge << ',' << s.rectangles << ','
-                    << s.pixels << ',' << s.box.left << ',' << s.box.top << ',' << s.box.right << ',' << s.box.bottom << ',' << s.pointer.x << ',' << s.pointer.y << '\n';
+                    << s.pixels << ',' << s.box.left << ',' << s.box.top << ',' << s.box.right << ',' << s.box.bottom << ',' << s.pointer.x << ',' << s.pointer.y << ','
+                    << s.presentId << ',' << s.displayed.PresentCount << ',' << s.displayed.PresentRefreshCount << ',' << s.displayed.SyncQPCTime.QuadPart << '\n';
             }
         } catch (...) { /* Diagnostic output cannot interfere with closing capture. */ }
     }
@@ -1124,6 +1129,9 @@ public:
     BoxDamage boxDamage;
     Region paintRegion;
     DragFrameClock dragClock;
+    FlipPresenter presenter;
+    Region presentedDamage;
+    bool presentPending{}, uploadingFrame{};
     DragTrace dragTrace;
     bool boxPaintPending{};
     RECT pendingBoxFrom{};
@@ -1148,6 +1156,7 @@ public:
 
     ~App() { releaseCanvas(); if (icon) DestroyIcon(icon); }
     void releaseCanvas() {
+        presenter.stop(); presentedDamage.clear(); presentPending = false;
         if (renderDc) { SelectObject(renderDc, previousCanvas); DeleteDC(renderDc); renderDc = nullptr; }
         canvas.reset();
         if (hudDc) { SelectObject(hudDc, previousHudCanvas); DeleteDC(hudDc); hudDc = nullptr; }
@@ -1189,6 +1198,7 @@ public:
         invalidateBoxChange(pendingBoxFrom, selectionBox);
     }
     void presentDragFrame() {
+        if (presenter.active()) { presentGpuFrame(); return; }
         dragClock.consume();
         if (!active || !dragging || !boxMode || !boxPaintPending || !frame) return;
         // A ready frame takes priority over queued mouse messages. Sample the
@@ -1202,6 +1212,59 @@ public:
         // WM_PAINT normally waits behind input. Submit this scheduled frame
         // directly rather than letting a high-polling mouse postpone it.
         UpdateWindow(window);
+    }
+    // Only include the swap-chain handle in the wait set when pixels changed.
+    // A signaled idle swap chain must never turn the message loop into a poll.
+    HANDLE pendingFrame() const {
+        if (presenter.active()) return (presentPending || boxPaintPending) ? presenter.ready : nullptr;
+        return dragClock.pendingTimer();
+    }
+    POINT currentDragPointer(POINT fallback) const {
+        POINT p{};
+        if (GetCapture() == window && GetCursorPos(&p) && ScreenToClient(window, &p)) return p;
+        return fallback;
+    }
+    void presentGpuFrame() {
+        if (!active || !frame || !presenter.active()) return;
+        if (dragging && boxMode) {
+            RECT old = selectionBox;
+            latestPointer = currentDragPointer(latestPointer);
+            selectionBox = dragRegion(dragOrigin, latestPointer, frame->image->width, frame->image->height);
+            if (!EqualRect(&old, &selectionBox) && !boxPaintPending) { pendingBoxFrom = old; boxPaintPending = true; }
+        }
+        applyPendingBoxDamage();
+        UpdateWindow(window); // collect any queued exposure/HUD/box damage
+        // A burst can return to the displayed box before this wake, leaving
+        // no damage. Still complete the acquired swap-chain opportunity with
+        // the retained scene; otherwise an auto-reset readiness signal could
+        // be consumed without Present and strand the next changed frame.
+        int64_t begin = DragFrameClock::now();
+        constexpr DWORD maxRects = 256;
+        alignas(RGNDATA) std::array<BYTE, sizeof(RGNDATAHEADER) + maxRects * sizeof(RECT)> storage;
+        auto data = reinterpret_cast<RGNDATA*>(storage.data());
+        DWORD bytes = GetRegionData(presentedDamage.get(), static_cast<DWORD>(storage.size()), data);
+        DWORD rectangles = 0; uint64_t pixels = 0;
+        uploadingFrame = true;
+        auto draw = [&](RECT r) {
+            render(nullptr, r); ++rectangles;
+            pixels += static_cast<uint64_t>(r.right - r.left) * (r.bottom - r.top);
+        };
+        if (bytes && bytes <= storage.size() && data->rdh.nCount <= maxRects) {
+            auto parts = reinterpret_cast<const RECT*>(data->Buffer);
+            for (DWORD i = 0; i < data->rdh.nCount; ++i) draw(parts[i]);
+        } else {
+            RECT bounds{}; GetRgnBox(presentedDamage.get(), &bounds); draw(bounds);
+        }
+        uploadingFrame = false;
+        SetRectRgn(presentedDamage.get(), 0, 0, 0, 0); presentPending = false;
+        if (!presenter.present()) {
+            presenter.stop(); // device removal/driver failure: repaint using GDI
+            if (dragging && boxMode) dragClock.start({latestPointer.x + frame->desktop.left, latestPointer.y + frame->desktop.top});
+            invalidate();
+        } else if (dragging && boxMode && dragTrace.enabled()) {
+            dragTrace.record(latestInput, begin, GetTickCount() - latestMessageTime, rectangles, pixels,
+                selectionBox, latestPointer, 0, presenter.presentId, presenter.displayed);
+        }
     }
     size_t selectedWords() const {
         return std::count_if(selection.begin(), selection.end(), [](Span s) { return s.begin < s.end; });
@@ -1413,6 +1476,7 @@ public:
         // Activation only freezes the desktop. Recognition starts on box release.
         SetWindowLongPtr(window, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_APPWINDOW);
         SetWindowPos(window, HWND_TOPMOST, frame->desktop.left, frame->desktop.top, frame->image->width, frame->image->height, SWP_SHOWWINDOW);
+        presenter.start(window, frame->image->width, frame->image->height);
         SetForegroundWindow(window); SetFocus(window); invalidate(); UpdateWindow(window);
     }
     void exitMode() {
@@ -1535,7 +1599,7 @@ public:
         if (dragTrace.enabled()) { latestInput = DragFrameClock::now(); latestMessageTime = static_cast<DWORD>(GetMessageTime()); }
         SetCapture(window); invalidate(hud);
         UpdateWindow(window);
-        dragClock.start({p.x + frame->desktop.left, p.y + frame->desktop.top});
+        if (!presenter.active()) dragClock.start({p.x + frame->desktop.left, p.y + frame->desktop.top});
     }
     void beginTextSelection(POINT p, bool add) {
         cancelRecognition();
@@ -1596,12 +1660,15 @@ public:
         }
         if (!dragging) return;
         if (boxMode) {
+            // WM_MOUSEMOVE can predate the cursor sampled by the last frame.
+            // Never let that queued coordinate rewind the visible box.
+            p = currentDragPointer(p);
             RECT old = selectionBox;
             selectionBox = dragRegion(dragOrigin, p, frame->image->width, frame->image->height);
             if (EqualRect(&old,&selectionBox)) return;
             latestPointer = p;
             if (dragTrace.enabled()) { latestInput = DragFrameClock::now(); latestMessageTime = static_cast<DWORD>(GetMessageTime()); }
-            if (dragClock.request({p.x + frame->desktop.left, p.y + frame->desktop.top})) {
+            if (presenter.active() || dragClock.request({p.x + frame->desktop.left, p.y + frame->desktop.top})) {
                 if (!boxPaintPending) pendingBoxFrom = old;
                 boxPaintPending = true;
             } else {
@@ -1862,6 +1929,20 @@ public:
             bytes = GetRegionData(update,static_cast<DWORD>(storage.size()),data);
         PAINTSTRUCT ps{}; HDC screen = BeginPaint(window, &ps);
         if (!active || !frame || !canvas) { EndPaint(window, &ps); return; }
+        if (presenter.active()) {
+            HRGN pending = presentedDamage.get();
+            if (pending) {
+                if (bytes && bytes <= storage.size() && data->rdh.nCount <= maxRectangles) CombineRgn(pending, pending, update, RGN_OR);
+                else {
+                    // The bounding rectangle also safely covers simple regions
+                    // and update regions too complex for the bounded array.
+                    HRGN part = CreateRectRgnIndirect(&ps.rcPaint);
+                    if (part) { CombineRgn(pending, pending, part, RGN_OR); DeleteObject(part); }
+                }
+                presentPending = true;
+            } else { presenter.stop(); invalidate(); }
+            EndPaint(window, &ps); return;
+        }
         DWORD rectangles = 0; uint64_t pixels = 0;
         if (bytes && bytes <= storage.size() && data->rdh.nCount <= maxRectangles) {
             auto parts = reinterpret_cast<const RECT*>(data->Buffer);
@@ -1922,7 +2003,10 @@ public:
         RECT toolbarDamage = hud;
         if (hudVisible() && intersects(toolbarDamage, damage)) renderHud(dc);
 
-        BitBlt(screen, damage.left, damage.top, damage.right - damage.left, damage.bottom - damage.top, dc, damage.left, damage.top, SRCCOPY);
+        if (uploadingFrame) {
+            GdiFlush(); // finish strokes/text before reading the DIB for upload
+            presenter.upload(damage, *canvas);
+        } else BitBlt(screen, damage.left, damage.top, damage.right - damage.left, damage.bottom - damage.top, dc, damage.left, damage.top, SRCCOPY);
     }
     void help() {
         MessageBox(window, (L"Press " + settings.hotkey + L" to capture screen text.\n\nCAPTURE\nDrag a box around text, then release.\nCtrl-drag adds another box. The toolbar can be dragged out of the way.\n\nSELECT\nAlt-drag refines text. Ctrl+Alt-drag adds a text range.\nDouble-click selects a word. Ctrl+A selects all recognized text.\n\nCOPY\nCtrl+C copies and keeps capture open.\nEnter copies and closes. You can press it while text is being read.\nCtrl+Shift+C copies as one line.\n\nRECOVER\nR retries the last box. Backspace clears the selection.\nEsc cancels a drag; otherwise it closes capture.\nRight-click for actions and OCR language.\nTab focuses toolbar buttons; Space or Enter activates them.\nF1 opens this help.\n\nText recognition runs locally. Screenshots stay in memory until capture closes.").c_str(),
@@ -2171,7 +2255,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         app.initialize(); if (captureNow) PostMessage(window, WM_HOTKEY, HOTKEY_ID, 0);
         MSG message{};
         for (;;) {
-            if (HANDLE timer = app.dragClock.pendingTimer()) {
+            if (HANDLE timer = app.pendingFrame()) {
                 DWORD ready = MsgWaitForMultipleObjectsEx(1, &timer, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
                 if (ready == WAIT_OBJECT_0) { SendMessage(window, WM_DRAG_FRAME, 0, 0); continue; }
                 if (ready == WAIT_FAILED) { app.shutdown(); code = 1; break; }
