@@ -23,6 +23,7 @@ Glyph is a small native C++20 tray app powered by Windows' offline OCR. It has n
 - Capture multiple monitors, including mixed DPI and negative monitor coordinates.
 - Configure the activation shortcut and OCR language from the tray menu.
 - Retry a box, clear a selection, queue copying while OCR finishes, or copy multiline text as one line.
+- Optionally close capture automatically after copying with the Copy button or a copy shortcut.
 - Enable start at login if you want it; it is off by default.
 - Stay idle without polling, timers, or repeated screen capture.
 
@@ -68,7 +69,7 @@ Quit Glyph before uninstalling. Use Windows Settings or `uninstall.ps1`. Optiona
 | Add a character range in recognized text | Ctrl+Alt-drag |
 | Select a recognized word | Double-click |
 | Select all recognized text | Ctrl+A |
-| Copy and keep OCR mode open | Ctrl+C or Copy button |
+| Copy (optionally close capture afterward in Settings) | Ctrl+C or Copy button |
 | Copy and exit | Enter |
 | Copy as one line | Ctrl+Shift+C or right-click menu |
 | Retry the last box | R or right-click menu |
@@ -87,12 +88,15 @@ Click the tray icon to capture. Its context menu offers OCR language, settings, 
 
 Open **Settings** from the tray to change the activation shortcut, choose an installed OCR language, or enable start at login. Save applies changes immediately. Invalid or unavailable shortcuts show an error in the window and keep your current shortcut.
 
+Enable **Close capture after copying** to return to your desktop after a successful copy with the Copy button, Ctrl+C, Ctrl+Shift+C, or a copy action in the right-click menu. Glyph stays running in the tray. This setting is off by default; Enter always copies and closes. Copies queued while recognition runs also follow this setting. Empty selections and clipboard errors keep capture open so you can retry.
+
 Advanced configuration is still available in `%APPDATA%\Glyph\settings.ini`; after editing it, select **Reload settings** from the tray.
 
 ```ini
 [Glyph]
 hotkey=Ctrl+Alt+T
 language=auto
+closeAfterCopy=0
 ```
 
 Shortcuts accept Ctrl, Alt, Shift, Win, letters, digits, Space, and F1–F24. Use at least one modifier for letters and digits. Some shortcuts are reserved or already registered by another application; Glyph reports conflicts.

@@ -225,7 +225,7 @@ private:
         if (haveStrip) append();
     }
 };
-struct Settings { std::wstring hotkey = L"Ctrl+Alt+T", language = L"auto"; UINT modifiers = MOD_CONTROL | MOD_ALT, key = 'T'; };
+struct Settings { std::wstring hotkey = L"Ctrl+Alt+T", language = L"auto"; UINT modifiers = MOD_CONTROL | MOD_ALT, key = 'T'; bool closeAfterCopy = false; };
 struct Job { uint64_t id{}; std::shared_ptr<Frame> frame; RECT region{}; std::wstring language; Clock::time_point started; };
 struct Result { uint64_t id{}; std::vector<Word> words; std::wstring error, language; bool complete{}; int elapsed{}; };
 struct EngineInfo { std::vector<std::pair<std::wstring, std::wstring>> languages; std::wstring error; };
@@ -1139,10 +1139,11 @@ public:
     int64_t latestInput{};
     DWORD latestMessageTime{};
     HICON icon{};
-    bool active{}, recognizing{}, dragging{}, boxMode{}, addRegion{}, quitting{};
+    bool active{}, recognizing{}, dragging{}, boxMode{}, addRegion{}, previousAddRegion{}, quitting{};
     bool hotkeyRegistered{}, movingHud{}, addNext{}, copied{}, trackingMouse{};
     int hovered{}, pressed{}, focused{}, pendingCopy{};
     uint64_t session{};
+    size_t regionWordStart{};
     int anchorWord{-1}, anchorCharacter{}, elapsed{};
     std::pair<int, int> textEnd{-1, 0};
     double uiScale{1.0};
@@ -1224,6 +1225,12 @@ public:
         if (GetCapture() == window && GetCursorPos(&p) && ScreenToClient(window, &p)) return p;
         return fallback;
     }
+    void fallbackToGdi() {
+        presenter.stop(); presentedDamage.clear(); presentPending = false;
+        if (active && frame && dragging && boxMode)
+            dragClock.start({latestPointer.x + frame->desktop.left, latestPointer.y + frame->desktop.top});
+        invalidate();
+    }
     void presentGpuFrame() {
         if (!active || !frame || !presenter.active()) return;
         if (dragging && boxMode) {
@@ -1234,6 +1241,10 @@ public:
         }
         applyPendingBoxDamage();
         UpdateWindow(window); // collect any queued exposure/HUD/box damage
+        // WM_PAINT can itself select the fallback if damage allocation fails.
+        if (!presenter.active()) { UpdateWindow(window); return; }
+        HRGN damage = presentedDamage.get();
+        if (!damage) { fallbackToGdi(); UpdateWindow(window); return; }
         // A burst can return to the displayed box before this wake, leaving
         // no damage. Still complete the acquired swap-chain opportunity with
         // the retained scene; otherwise an auto-reset readiness signal could
@@ -1242,25 +1253,25 @@ public:
         constexpr DWORD maxRects = 256;
         alignas(RGNDATA) std::array<BYTE, sizeof(RGNDATAHEADER) + maxRects * sizeof(RECT)> storage;
         auto data = reinterpret_cast<RGNDATA*>(storage.data());
-        DWORD bytes = GetRegionData(presentedDamage.get(), static_cast<DWORD>(storage.size()), data);
+        DWORD bytes = GetRegionData(damage, static_cast<DWORD>(storage.size()), data);
         DWORD rectangles = 0; uint64_t pixels = 0;
-        uploadingFrame = true;
         auto draw = [&](RECT r) {
             render(nullptr, r); ++rectangles;
             pixels += static_cast<uint64_t>(r.right - r.left) * (r.bottom - r.top);
         };
-        if (bytes && bytes <= storage.size() && data->rdh.nCount <= maxRects) {
-            auto parts = reinterpret_cast<const RECT*>(data->Buffer);
-            for (DWORD i = 0; i < data->rdh.nCount; ++i) draw(parts[i]);
-        } else {
-            RECT bounds{}; GetRgnBox(presentedDamage.get(), &bounds); draw(bounds);
+        {
+            struct UploadScope { bool& flag; ~UploadScope() { flag = false; } } scope{uploadingFrame};
+            uploadingFrame = true;
+            if (bytes && bytes <= storage.size() && data->rdh.nCount <= maxRects) {
+                auto parts = reinterpret_cast<const RECT*>(data->Buffer);
+                for (DWORD i = 0; i < data->rdh.nCount; ++i) draw(parts[i]);
+            } else {
+                RECT bounds{}; GetRgnBox(damage, &bounds); draw(bounds);
+            }
         }
-        uploadingFrame = false;
-        SetRectRgn(presentedDamage.get(), 0, 0, 0, 0); presentPending = false;
+        SetRectRgn(damage, 0, 0, 0, 0); presentPending = false;
         if (!presenter.present()) {
-            presenter.stop(); // device removal/driver failure: repaint using GDI
-            if (dragging && boxMode) dragClock.start({latestPointer.x + frame->desktop.left, latestPointer.y + frame->desktop.top});
-            invalidate();
+            fallbackToGdi(); // device removal/driver failure: repaint using GDI
         } else if (dragging && boxMode && dragTrace.enabled()) {
             dragTrace.record(latestInput, begin, GetTickCount() - latestMessageTime, rectangles, pixels,
                 selectionBox, latestPointer, 0, presenter.presentId, presenter.displayed);
@@ -1373,6 +1384,7 @@ public:
         Settings next;
         GetPrivateProfileString(L"Glyph", L"hotkey", L"Ctrl+Alt+T", value, 256, config.c_str()); next.hotkey = value;
         GetPrivateProfileString(L"Glyph", L"language", L"auto", value, 256, config.c_str()); next.language = value;
+        next.closeAfterCopy = GetPrivateProfileInt(L"Glyph", L"closeAfterCopy", 0, config.c_str()) != 0;
         std::wstring error;
         if (!applySettings(std::move(next), error)) notify(error + L" Open Settings from the tray to change it.", true);
     }
@@ -1400,6 +1412,7 @@ public:
             }
             SendMessage(combo, CB_SETCURSEL, selected, 0);
             CheckDlgButton(dialog, IDC_STARTUP, app->startupEnabled() ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(dialog, IDC_CLOSE_AFTER_COPY, app->settings.closeAfterCopy ? BST_CHECKED : BST_UNCHECKED);
             RECT box{}; GetWindowRect(dialog, &box);
             MONITORINFO info{sizeof(info)}; GetMonitorInfo(MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST), &info);
             SetWindowPos(dialog, HWND_TOP, info.rcWork.left + (info.rcWork.right - info.rcWork.left - box.right + box.left) / 2,
@@ -1412,20 +1425,23 @@ public:
         if (message == WM_COMMAND && LOWORD(wp) == IDOK) {
             wchar_t shortcut[128]{}; GetDlgItemText(dialog, IDC_SHORTCUT, shortcut, 128);
             Settings next = app->settings, old = app->settings; next.hotkey = shortcut;
+            next.closeAfterCopy = IsDlgButtonChecked(dialog, IDC_CLOSE_AFTER_COPY) == BST_CHECKED;
             int language = static_cast<int>(SendDlgItemMessage(dialog, IDC_LANGUAGE, CB_GETCURSEL, 0, 0));
             if (language >= 0 && language < static_cast<int>(app->settingsLanguages.size())) next.language = app->settingsLanguages[language];
             std::wstring error;
             if (!app->applySettings(std::move(next), error)) { SetDlgItemText(dialog, IDC_SETTINGS_ERROR, error.c_str()); return TRUE; }
             if (!WritePrivateProfileString(L"Glyph", L"hotkey", app->settings.hotkey.c_str(), app->config.c_str()) ||
-                !WritePrivateProfileString(L"Glyph", L"language", app->settings.language.c_str(), app->config.c_str())) {
+                !WritePrivateProfileString(L"Glyph", L"language", app->settings.language.c_str(), app->config.c_str()) ||
+                !WritePrivateProfileString(L"Glyph", L"closeAfterCopy", app->settings.closeAfterCopy ? L"1" : L"0", app->config.c_str())) {
                 app->applySettings(old, error);
                 WritePrivateProfileString(L"Glyph", L"hotkey", old.hotkey.c_str(), app->config.c_str());
                 WritePrivateProfileString(L"Glyph", L"language", old.language.c_str(), app->config.c_str());
+                WritePrivateProfileString(L"Glyph", L"closeAfterCopy", old.closeAfterCopy ? L"1" : L"0", app->config.c_str());
                 SetDlgItemText(dialog, IDC_SETTINGS_ERROR, L"Could not save settings. Check the settings file is writable."); return TRUE;
             }
             if ((IsDlgButtonChecked(dialog, IDC_STARTUP) == BST_CHECKED) != app->startupEnabled() && !app->toggleStartup()) {
                 CheckDlgButton(dialog, IDC_STARTUP, app->startupEnabled() ? BST_CHECKED : BST_UNCHECKED);
-                SetDlgItemText(dialog, IDC_SETTINGS_ERROR, L"Shortcut and language saved. Could not change start at login."); return TRUE;
+                SetDlgItemText(dialog, IDC_SETTINGS_ERROR, L"Settings saved. Could not change start at login."); return TRUE;
             }
             EndDialog(dialog, 1); return TRUE;
         }
@@ -1455,6 +1471,43 @@ public:
         if (!result) winrt::throw_last_error();
         return result;
     }
+    void prepareCaptureFrame() {
+        // A hidden HWND may discard invalidation. Explicitly initialize the
+        // entire retained scene before its first presentation, including tiles
+        // that belonged to the previous capture on this same HWND.
+        if (presenter.active()) {
+            if (!SetRectRgn(presentedDamage.get(), 0, 0, frame->image->width, frame->image->height)) fallbackToGdi();
+            else {
+                presentPending = true;
+                if (WaitForSingleObject(presenter.ready, 1000) == WAIT_OBJECT_0) presentGpuFrame();
+                else fallbackToGdi();
+            }
+        }
+        // Also initialize the GDI surface if hardware startup/presentation failed.
+        if (!presenter.active()) { invalidate(); UpdateWindow(window); GdiFlush(); }
+    }
+    void showCapture() {
+        // DWM retains the previous contents of a reused HWND. Keep composing
+        // while concealed until the fresh capture has replaced those pixels.
+        BOOL conceal = TRUE;
+        winrt::check_hresult(DwmSetWindowAttribute(window, DWMWA_CLOAK, &conceal, sizeof(conceal)));
+        DwmSetWindowAttribute(window, DWMWA_TRANSITIONS_FORCEDISABLED, &conceal, sizeof(conceal));
+        try {
+            SetWindowLongPtr(window, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_APPWINDOW);
+            if (!SetWindowPos(window, HWND_TOPMOST, frame->desktop.left, frame->desktop.top,
+                frame->image->width, frame->image->height, SWP_SHOWWINDOW | SWP_NOACTIVATE)) winrt::throw_last_error();
+            presenter.start(window, frame->image->width, frame->image->height);
+            prepareCaptureFrame();
+            winrt::check_hresult(DwmFlush());
+            conceal = FALSE;
+            winrt::check_hresult(DwmSetWindowAttribute(window, DWMWA_CLOAK, &conceal, sizeof(conceal)));
+        } catch (...) {
+            ShowWindow(window, SW_HIDE);
+            conceal = FALSE;
+            DwmSetWindowAttribute(window, DWMWA_CLOAK, &conceal, sizeof(conceal));
+            throw;
+        }
+    }
     void activate() {
         if (settingsWindow) { SetForegroundWindow(settingsWindow); return; }
         if (active) { exitMode(); return; }
@@ -1468,16 +1521,15 @@ public:
         highlights.clear();
         status = L"Drag a box around the text you need.";
         active = true; recognizing = false; dragging = false; boxMode = true; anchorWord = -1; elapsed = 0;
-        selectionBox = {}; previousBox = {}; copied = false; lastError.clear();
+        selectionBox = {}; previousBox = {}; regionWordStart = 0; copied = false; lastError.clear();
         movingHud = false; addNext = false; hovered = pressed = focused = pendingCopy = 0;
         session = ++worker->generation;
         POINT cursor{}; GetCursorPos(&cursor);
         placeHud({cursor.x - frame->desktop.left, cursor.y - frame->desktop.top});
         // Activation only freezes the desktop. Recognition starts on box release.
-        SetWindowLongPtr(window, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_APPWINDOW);
-        SetWindowPos(window, HWND_TOPMOST, frame->desktop.left, frame->desktop.top, frame->image->width, frame->image->height, SWP_SHOWWINDOW);
-        presenter.start(window, frame->image->width, frame->image->height);
-        SetForegroundWindow(window); SetFocus(window); invalidate(); UpdateWindow(window);
+        try { showCapture(); }
+        catch (...) { exitMode(); throw; }
+        SetForegroundWindow(window); SetFocus(window);
     }
     void exitMode() {
         if (!active) return;
@@ -1506,6 +1558,14 @@ public:
     }
     void accept(Result& r) {
         if (!active || r.id != session) return;
+        try { acceptResult(r); }
+        catch (...) {
+            recognizing = false; pendingCopy = 0;
+            invalidate();
+            throw;
+        }
+    }
+    void acceptResult(Result& r) {
         bool foundText = !r.words.empty();
         // Ctrl-drag can overlap a previous box. Select existing words again rather
         // than duplicating their text in the clipboard or remeasuring them.
@@ -1528,8 +1588,13 @@ public:
         // font/metrics allocation throws, unlike an acquired window DC.
         HDC dc = renderDc; TextMetricsCache metrics;
         size_t existing = words.size();
+        // Prepare before committing: a failed font/metrics allocation must not
+        // leave new words without matching selection spans and row indexes.
+        for (auto& word : r.words) measure(word, dc, metrics);
+        words.reserve(existing + r.words.size());
+        selection.reserve(existing + r.words.size());
+        wordRows.reserve(wordRows.size() + r.words.size());
         words.insert(words.end(), std::make_move_iterator(r.words.begin()), std::make_move_iterator(r.words.end()));
-        for (size_t i = existing; i < words.size(); ++i) measure(words[i], dc, metrics);
         // OCR boxes describe ink rather than line height: short letters, capitals, and
         // descenders have different bounds. Normalize nearby words into one padded
         // band, splitting wide gaps so unrelated columns never get connected.
@@ -1565,7 +1630,7 @@ public:
         else status = detectedLanguage + L"  \x00b7  Ctrl+C to copy  \x00b7  Enter to copy and close";
         if (r.complete && pendingCopy) {
             int action = std::exchange(pendingCopy, 0);
-            if (r.error.empty() && selectedWords()) { invalidate(); copy(action == 2, action == 3); return; }
+            if (r.error.empty() && foundText && selectedWords()) { invalidate(); copy(action == 2 || action == 4, action >= 3); return; }
         }
         invalidate();
     }
@@ -1590,6 +1655,7 @@ public:
         if (!active || !frame) return;
         cancelRecognition();
         previousBox = selectionBox;
+        previousAddRegion = addRegion;
         boxMode = true; addRegion = add || addNext; addNext = false; copied = false;
         dragOrigin = p; dragging = true; focused = 0;
         selectionBox = dragRegion(p, p, frame->image->width, frame->image->height);
@@ -1741,6 +1807,7 @@ public:
         if (!recognize || selectionBox.right - selectionBox.left < 3 || selectionBox.bottom - selectionBox.top < 3) {
             RECT old = selectionBox;
             selectionBox = previousBox;
+            addRegion = previousAddRegion;
             status = words.empty() ? L"Drag a box around the text you need." : L"Selection kept. Ctrl+C to copy or draw another box.";
             invalidateBoxChange(old, selectionBox); invalidate(hud); return;
         }
@@ -1748,6 +1815,7 @@ public:
             words.clear(); wordRows.clear(); selection.clear(); baseSelection.clear();
             fonts.clear(); highlights.clear(); detectedLanguage.clear();
         }
+        regionWordStart = words.size();
         recognizing = true; copied = false; lastError.clear(); elapsed = 0;
         status = L"Reading this box. You can press Enter to copy as soon as it's ready.";
         avoidSelection();
@@ -1779,8 +1847,10 @@ public:
         return output;
     }
     void copy(bool exitAfter, bool oneLine = false) {
+        exitAfter = exitAfter || settings.closeAfterCopy;
         if (recognizing) {
-            pendingCopy = exitAfter ? 2 : oneLine ? 3 : 1;
+            // Preserve both options when a single-line copy also closes capture.
+            pendingCopy = oneLine ? (exitAfter ? 4 : 3) : (exitAfter ? 2 : 1);
             status = exitAfter ? L"Will copy and close when ready. Esc cancels." : L"Will copy when ready. Esc cancels.";
             invalidate(hud); return;
         }
@@ -1928,7 +1998,8 @@ public:
         if (update && GetUpdateRgn(window,update,FALSE) == COMPLEXREGION)
             bytes = GetRegionData(update,static_cast<DWORD>(storage.size()),data);
         PAINTSTRUCT ps{}; HDC screen = BeginPaint(window, &ps);
-        if (!active || !frame || !canvas) { EndPaint(window, &ps); return; }
+        struct PaintScope { HWND window; PAINTSTRUCT& paint; ~PaintScope() { EndPaint(window, &paint); } } scope{window, ps};
+        if (!active || !frame || !canvas) return;
         if (presenter.active()) {
             HRGN pending = presentedDamage.get();
             if (pending) {
@@ -1940,8 +2011,8 @@ public:
                     if (part) { CombineRgn(pending, pending, part, RGN_OR); DeleteObject(part); }
                 }
                 presentPending = true;
-            } else { presenter.stop(); invalidate(); }
-            EndPaint(window, &ps); return;
+            } else fallbackToGdi();
+            return;
         }
         DWORD rectangles = 0; uint64_t pixels = 0;
         if (bytes && bytes <= storage.size() && data->rdh.nCount <= maxRectangles) {
@@ -1956,7 +2027,6 @@ public:
             pixels = static_cast<uint64_t>(ps.rcPaint.right - ps.rcPaint.left) * (ps.rcPaint.bottom - ps.rcPaint.top);
             rectangles = 1;
         }
-        EndPaint(window, &ps);
         // The last tile's BitBlt must reach the window before we return to
         // waiting for input. Otherwise its GDI batch can linger until later work.
         GdiFlush();
@@ -2009,12 +2079,22 @@ public:
         } else BitBlt(screen, damage.left, damage.top, damage.right - damage.left, damage.bottom - damage.top, dc, damage.left, damage.top, SRCCOPY);
     }
     void help() {
-        MessageBox(window, (L"Press " + settings.hotkey + L" to capture screen text.\n\nCAPTURE\nDrag a box around text, then release.\nCtrl-drag adds another box. The toolbar can be dragged out of the way.\n\nSELECT\nAlt-drag refines text. Ctrl+Alt-drag adds a text range.\nDouble-click selects a word. Ctrl+A selects all recognized text.\n\nCOPY\nCtrl+C copies and keeps capture open.\nEnter copies and closes. You can press it while text is being read.\nCtrl+Shift+C copies as one line.\n\nRECOVER\nR retries the last box. Backspace clears the selection.\nEsc cancels a drag; otherwise it closes capture.\nRight-click for actions and OCR language.\nTab focuses toolbar buttons; Space or Enter activates them.\nF1 opens this help.\n\nText recognition runs locally. Screenshots stay in memory until capture closes.").c_str(),
+        MessageBox(window, (L"Press " + settings.hotkey + L" to capture screen text.\n\nCAPTURE\nDrag a box around text, then release.\nCtrl-drag adds another box. The toolbar can be dragged out of the way.\n\nSELECT\nAlt-drag refines text. Ctrl+Alt-drag adds a text range.\nDouble-click selects a word. Ctrl+A selects all recognized text.\n\nCOPY\nCtrl+C or the Copy button copies text.\nEnable Close capture after copying in Settings to close automatically.\nEnter always copies and closes. You can press it while text is being read.\nCtrl+Shift+C copies as one line.\n\nRECOVER\nR retries the last box. Backspace clears the selection.\nEsc cancels a drag; otherwise it closes capture.\nRight-click for actions and OCR language.\nTab focuses toolbar buttons; Space or Enter activates them.\nF1 opens this help.\n\nText recognition runs locally. Screenshots stay in memory until capture closes.").c_str(),
             L"Glyph shortcuts", MB_OK | MB_ICONINFORMATION);
+    }
+    void discardRegionResult() {
+        if (!addRegion || regionWordStart >= words.size()) return;
+        // Retry replaces the last added box. Otherwise position deduplication
+        // keeps its old readings and silently discards corrected OCR results.
+        words.resize(regionWordStart); selection.resize(regionWordStart); baseSelection.clear();
+        wordRows.erase(std::remove_if(wordRows.begin(), wordRows.end(), [&](const WordRow& row) {
+            return row.first >= regionWordStart;
+        }), wordRows.end());
+        highlights.changed();
     }
     void retry() {
         if (IsRectEmpty(&selectionBox)) return;
-        cancelRecognition(); previousBox = selectionBox;
+        cancelRecognition(); discardRegionResult(); previousBox = selectionBox;
         boxMode = true; dragging = true; finishDrag(true);
     }
     void clearSelection() {
